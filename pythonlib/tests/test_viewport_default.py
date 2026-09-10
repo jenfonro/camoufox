@@ -25,6 +25,9 @@ def _opts(config_blob: str):
         ('{"document.body.clientWidth": 360}', True),
         ('{"screen.width": 360}', False),
         ('{"navigator.userAgent": "x"}', False),
+        ('{"window:profile": {"screen.width": 1920, "screen.height": 1080}}', True),
+        ('{"window:mode": "native", "window.outerWidth": 360}', True),
+        ('{"screen.width": 1920, "window:profile": {"window.innerWidth": 900}}', False),
         ("{}", False),
     ],
 )

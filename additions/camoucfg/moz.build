@@ -10,6 +10,7 @@ with Files("**"):
 EXPORTS += [
     "MaskConfig.hpp",
     "MouseTrajectories.hpp",
+    "WindowResolution.hpp",
 ]
 
 LOCAL_INCLUDES += [

@@ -40,6 +40,7 @@ from .pkgman import (
 from .virtdisplay import VirtualDisplay
 from ._warnings import LeakWarning
 from .webgl import sample_webgl
+from .window import GEOMETRY_KEYS, effective_geometry, finish_window_options, validate_window_options
 
 ListOrString: TypeAlias = Union[Tuple[str, ...], List[str], str]
 
@@ -226,6 +227,7 @@ def validate_config(config_map: Dict[str, str], path: Optional[Path] = None) -> 
     """
     Validates the config map.
     """
+    validate_window_options(config_map)
     property_types = _load_properties(path=path)
 
     for key, value in config_map.items():
@@ -474,16 +476,25 @@ _WINDOW_DIM_KEYS = (
 
 def spoofs_window_dimensions(from_options: Dict[str, Any]) -> bool:
     """
-    Whether the CAMOU_CONFIG in a set of launch options spoofs any window
-    dimension. The config is chunked across CAMOU_CONFIG_<n> env vars, so
-    reassemble it in index order before looking.
+    Whether the launch needs Playwright's implicit viewport disabled.
+    Profile/native modes leave the real window to Firefox; the driver must
+    not immediately override that with its default 1280x720 viewport.
     """
     env = from_options.get('env') or {}
-    chunks = [(int(k.rsplit('_', 1)[1]), v) for k, v in env.items() if k.startswith('CAMOU_CONFIG_')]
-    if not chunks:
+    chunks = [(int(k.rsplit('_', 1)[1]), v) for k, v in env.items()
+              if k.startswith('CAMOU_CONFIG_') and k.rsplit('_', 1)[1].isdigit()]
+    blob = ''.join(v for _, v in sorted(chunks)) if chunks else env.get('CAMOU_CONFIG', '{}')
+    try:
+        config = orjson.loads(blob)
+    except (orjson.JSONDecodeError, TypeError):
         return False
-    blob = ''.join(v for _, v in sorted(chunks))
-    return any(key in blob for key in _WINDOW_DIM_KEYS)
+    if not isinstance(config, dict):
+        return False
+    if config.get('window:mode') == 'native':
+        return True
+    if 'window:profile' in config and not any(key in config for key in GEOMETRY_KEYS):
+        return True
+    return any(key in config for key in _WINDOW_DIM_KEYS)
 
 
 def attach_no_viewport_default(target: Any) -> Any:
@@ -708,6 +719,13 @@ def launch_options(
     # Build the config
     if config is None:
         config = {}
+    else:
+        config = dict(config)
+    validate_window_options(config)
+    _explicit_global_geometry = (
+        any(key in config for key in GEOMETRY_KEYS)
+        or window is not None or screen is not None or fingerprint is not None
+    )
 
     # Set default values for optional arguments
     if headless is None:
@@ -837,6 +855,8 @@ def launch_options(
         fix_screen_no_taskbar(config, target_os)
         clamp_window_dimensions(config)
         clamp_window_position(config)
+
+    finish_window_options(config, explicit_global=_explicit_global_geometry)
 
     # Deliberately NOT setting window.history.length. It used to be pinned to a
     # random 1-5 because browser.sessionhistory.max_entries=0 left the real
@@ -988,8 +1008,9 @@ def launch_options(
             # already picked. Sampling the two independently yields pairs no
             # real machine ships -- a discrete desktop GPU behind a 1024x600
             # panel -- which consistency checks read as masking (#729).
+            geometry = effective_geometry(config)
             webgl_fp = sample_webgl_for_screen(
-                target_os, config.get('screen.width'), config.get('screen.height')
+                target_os, geometry.get('screen.width'), geometry.get('screen.height')
             )
         enable_webgl2 = webgl_fp.pop('webGl2Enabled')
 

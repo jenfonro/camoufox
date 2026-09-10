@@ -114,7 +114,12 @@ export function initialize(browsingContext, docShell) {
         const listeners = [];
         const check = () => {
           helper.removeListeners(listeners);
-          if (docShell.domWindow.innerWidth === width && docShell.domWindow.innerHeight === height) {
+          // The content-facing innerWidth/innerHeight may be a portrait.
+          // Synchronize against the actual CSS viewport in the pres context.
+          const [actualWidth, actualHeight] =
+            ChromeUtils.camouGetNativeViewportSize(docShell.domWindow);
+          if (Math.abs(actualWidth - width) < 1 &&
+              Math.abs(actualHeight - height) < 1) {
             resolve();
             return;
           }

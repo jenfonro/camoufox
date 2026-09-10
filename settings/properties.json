@@ -38,6 +38,8 @@
   { "property": "window.screenY", "type": "int" },
   { "property": "window.history.length", "type": "uint" },
   { "property": "window.devicePixelRatio", "type": "double" },
+  { "property": "window:profile", "type": "dict" },
+  { "property": "window:mode", "type": "str" },
   { "property": "document.body.clientWidth", "type": "uint" },
   { "property": "document.body.clientHeight", "type": "uint" },
   { "property": "document.body.clientTop", "type": "uint" },
