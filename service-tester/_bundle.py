@@ -1,4 +1,5 @@
 import http.server
+import json
 import socketserver
 import subprocess
 import sys
@@ -6,6 +7,33 @@ import threading
 from pathlib import Path
 
 from _constants import BUILD_TESTER_DIR
+
+
+def _revive(value):
+    if isinstance(value, list):
+        return [_revive(item) for item in value]
+    if isinstance(value, dict):
+        if "__undefined__" in value:
+            return None
+        if "__nonfinite__" in value:
+            return float(value["__nonfinite__"])
+        return {key: _revive(item) for key, item in value.items()}
+    return value
+
+
+async def collect_results(page, timeout=120000):
+    # The shared test page publishes to this DOM node. Juggler's isolated
+    # evaluation world cannot read the page's private window globals.
+    await page.wait_for_selector("#__camoufoxResults__", state="attached", timeout=timeout)
+    raw = await page.locator("#__camoufoxResults__").text_content()
+    if not raw:
+        return None, "results node was empty"
+    payload = _revive(json.loads(raw))
+    if payload.get("error"):
+        return None, payload["error"]
+    if not isinstance(payload.get("results"), dict):
+        return None, "results payload was missing"
+    return payload["results"], None
 
 
 def ensure_bundle() -> Path:

@@ -110,6 +110,75 @@
     "mediaDevices:enabled": "bool",
     "media:spoof_codecs": "bool",
 
+    "gfx:hardwareAcceleration": "bool",
+    "webgpu:enabled": "bool",
+    "webgpu:profile": {
+        "gpu": {
+            "wgslLanguageFeatures": "array[str[packed_4x8_integer_dot_product, pointer_composite_access, readonly_and_readwrite_storage_textures]]",
+            "preferredCanvasFormat": "str[rgba8unorm, bgra8unorm]"
+        },
+        "adapter": "@WEBGPU_ADAPTER",
+        "adapterOverrides": "array[@WEBGPU_OVERRIDE]"
+    },
+    "@WEBGPU_OVERRIDE": {
+        "*request": {
+            "powerPreference": "str[low-power, high-performance]",
+            "forceFallbackAdapter": "bool",
+            "featureLevel": "str[core, compatibility]",
+            "xrCompatible": "bool"
+        },
+        "*adapter": "@WEBGPU_ADAPTER"
+    },
+    "@WEBGPU_ADAPTER": {
+        "info": {
+            "vendor": "str",
+            "architecture": "str",
+            "device": "str",
+            "description": "str",
+            "subgroupMinSize": "int[0-4294967295]",
+            "subgroupMaxSize": "int[0-4294967295]",
+            "isFallbackAdapter": "bool"
+        },
+        "features": "array[str[core-features-and-limits, depth-clip-control, depth32float-stencil8, texture-compression-bc, texture-compression-bc-sliced-3d, texture-compression-etc2, texture-compression-astc, texture-compression-astc-sliced-3d, timestamp-query, indirect-first-instance, shader-f16, rg11b10ufloat-renderable, bgra8unorm-storage, float32-filterable, float32-blendable, clip-distances, dual-source-blending, subgroups, primitive-index]]",
+        "limits": {
+            "maxTextureDimension1D": "int[0-4294967295]",
+            "maxTextureDimension2D": "int[0-4294967295]",
+            "maxTextureDimension3D": "int[0-4294967295]",
+            "maxTextureArrayLayers": "int[0-4294967295]",
+            "maxBindGroups": "int[0-4294967295]",
+            "maxBindGroupsPlusVertexBuffers": "int[0-4294967295]",
+            "maxBindingsPerBindGroup": "int[0-4294967295]",
+            "maxDynamicUniformBuffersPerPipelineLayout": "int[0-4294967295]",
+            "maxDynamicStorageBuffersPerPipelineLayout": "int[0-4294967295]",
+            "maxSampledTexturesPerShaderStage": "int[0-4294967295]",
+            "maxSamplersPerShaderStage": "int[0-4294967295]",
+            "maxStorageBuffersInVertexStage": "int[0-4294967295]",
+            "maxStorageBuffersInFragmentStage": "int[0-4294967295]",
+            "maxStorageBuffersPerShaderStage": "int[0-4294967295]",
+            "maxStorageTexturesInVertexStage": "int[0-4294967295]",
+            "maxStorageTexturesInFragmentStage": "int[0-4294967295]",
+            "maxStorageTexturesPerShaderStage": "int[0-4294967295]",
+            "maxUniformBuffersPerShaderStage": "int[0-4294967295]",
+            "maxUniformBufferBindingSize": "int[0-9007199254740991]",
+            "maxStorageBufferBindingSize": "int[0-9007199254740991]",
+            "minUniformBufferOffsetAlignment": "int[0-4294967295]",
+            "minStorageBufferOffsetAlignment": "int[0-4294967295]",
+            "maxVertexBuffers": "int[0-4294967295]",
+            "maxBufferSize": "int[0-9007199254740991]",
+            "maxVertexAttributes": "int[0-4294967295]",
+            "maxVertexBufferArrayStride": "int[0-4294967295]",
+            "maxInterStageShaderVariables": "int[0-4294967295]",
+            "maxColorAttachments": "int[0-4294967295]",
+            "maxColorAttachmentBytesPerSample": "int[0-4294967295]",
+            "maxComputeWorkgroupStorageSize": "int[0-4294967295]",
+            "maxComputeInvocationsPerWorkgroup": "int[0-4294967295]",
+            "maxComputeWorkgroupSizeX": "int[0-4294967295]",
+            "maxComputeWorkgroupSizeY": "int[0-4294967295]",
+            "maxComputeWorkgroupSizeZ": "int[0-4294967295]",
+            "maxComputeWorkgroupsPerDimension": "int[0-4294967295]"
+        }
+    },
+
     "webGl:renderer$__WEBGL": "str",
     "webGl:vendor$__WEBGL": "str",
 
