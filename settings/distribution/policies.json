@@ -19,11 +19,8 @@
     "DisplayBookmarksToolbar": "never",
     "DontCheckDefaultBrowser": true,
     "DisableFirefoxAccounts": true,
-    "DisableFormHistory": true,
     "HardwareAcceleration": false,
     "WindowsSSO": false,
-    "PasswordManagerEnabled": false,
-    "OfferToSaveLogins": false,
     "ExtensionUpdate": false,
     "PDFjs": {
       "Enabled": true,
@@ -42,8 +39,7 @@
         "twitter@search.mozilla.org",
         "webcompat@mozilla.org",
         "screenshots@mozilla.org",
-        "pictureinpicture@mozilla.org",
-        "formautofill@mozilla.org"
+        "pictureinpicture@mozilla.org"
       ]
     },
     "ExtensionSettings": {

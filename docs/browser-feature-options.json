@@ -1,0 +1,21 @@
+{
+  "config": {
+    "disableTheming": true
+  },
+  "firefox_user_prefs": {
+    "browser.formfill.enable": true,
+    "signon.rememberSignons": true,
+    "signon.autofillForms": true,
+    "services.passwordSavingEnabled": true,
+    "signon.formlessCapture.enabled": true,
+    "extensions.formautofill.addresses.enabled": true,
+    "extensions.formautofill.addresses.supported": "on",
+    "extensions.formautofill.creditCards.enabled": true,
+    "extensions.formautofill.creditCards.supported": "on",
+    "places.history.enabled": true,
+    "browser.urlbar.suggest.history": true,
+    "browser.urlbar.autoFill": true,
+    "browser.urlbar.autoFill.adaptiveHistory.enabled": true,
+    "browser.urlbar.maxRichResults": 10
+  }
+}
