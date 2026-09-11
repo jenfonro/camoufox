@@ -11,14 +11,12 @@ function simpleHash(data: Float32Array | Uint8Array): string {
   return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
-function canvasHash(operations: (ctx: CanvasRenderingContext2D) => void): string {
-  const canvas = document.createElement("canvas");
-  canvas.width = 200;
-  canvas.height = 50;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return "no-context";
-  operations(ctx);
-  return canvas.toDataURL().substring(0, 100);
+async function completeExportHash(dataUrl: string): Promise<string> {
+  // PNG session metadata follows the image data; a URL prefix cannot see it.
+  const digest = new Uint8Array(await crypto.subtle.digest(
+    "SHA-256", new TextEncoder().encode(dataUrl)
+  ));
+  return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 export async function collectFingerprints(): Promise<FingerprintData> {
@@ -74,7 +72,7 @@ export async function collectFingerprints(): Promise<FingerprintData> {
   } catch {}
 
   // Canvas
-  const canvasData = (() => {
+  const canvasData = await (async () => {
     try {
       const c = document.createElement("canvas");
       c.width = 200;
@@ -90,7 +88,7 @@ export async function collectFingerprints(): Promise<FingerprintData> {
       ctx.fillStyle = "rgba(102, 204, 0, 0.7)";
       ctx.fillText("Cwm fjordbank", 4, 17);
       const url = c.toDataURL();
-      return { hash: url.substring(0, 100), dataUrlPrefix: url.substring(0, 30) };
+      return { hash: await completeExportHash(url), dataUrlPrefix: url.substring(0, 30) };
     } catch {
       return { hash: "error", dataUrlPrefix: "" };
     }
@@ -178,12 +176,8 @@ export async function collectFingerprints(): Promise<FingerprintData> {
     }
   })();
 
-  // Font metrics — use "Arial" (concrete font name) instead of "monospace" (generic family).
-  // The fontPlatformConsistency check in extended.ts calls isFontAvailable() 11 times with
-  // different font families + monospace fallback, which pollutes fontconfig's generic family
-  // resolution cache. On macOS Global (CAMOU_CONFIG), this causes "monospace" to resolve to
-  // a different actual font between the two collectFingerprints() calls (42.6px delta observed).
-  // Arial is a concrete font always available in all Camoufox font lists, immune to this.
+  // Use a fixed family request for both collections. A profile may omit Arial;
+  // in that case its native fallback must remain stable as caches warm up too.
   await document.fonts.ready;
   const fontData = (() => {
     try {
@@ -220,7 +214,7 @@ export async function collectFingerprints(): Promise<FingerprintData> {
   })();
 
   // Emoji canvas
-  const emojiData = (() => {
+  const emojiData = await (async () => {
     try {
       const c = document.createElement("canvas");
       c.width = 200;
@@ -229,7 +223,7 @@ export async function collectFingerprints(): Promise<FingerprintData> {
       if (!ctx) return { hash: "no-context" };
       ctx.font = "32px serif";
       ctx.fillText("\uD83D\uDE00\uD83D\uDC4D\uD83C\uDFE0\u2764\uFE0F", 0, 40);
-      return { hash: c.toDataURL().substring(50, 120) };
+      return { hash: await completeExportHash(c.toDataURL()) };
     } catch {
       return { hash: "error" };
     }
@@ -263,7 +257,7 @@ export async function collectFingerprints(): Promise<FingerprintData> {
       return {
         detected,
         count: detected.length,
-        hash: detected.join(",").substring(0, 100),
+        hash: detected.join(","),
       };
     } catch {
       return { detected: [], count: 0, hash: "error" };

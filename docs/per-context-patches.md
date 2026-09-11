@@ -1,5 +1,12 @@
 # Per-Context Fingerprint Patches
 
+Current implementation note (2026-09-11): the Canvas manager/setter described
+below is a historical design and is not present in this source tree. Fixed
+Canvas input is currently provided by the process-wide `canvas:seed` setting;
+there is no `window.setCanvasSeed` method. The existing font/audio context
+setters support explicit zero and Worker propagation. See the current
+[persistence contract](fingerprint-persistence.md) for implemented scope.
+
 Camoufox spoofs fingerprints globally via `CAMOU_CONFIG` — every browser context shares the same identity. These patches add **per-context isolation**, so each Playwright context can have a unique, deterministic fingerprint. This lets you run multiple concurrent sessions from a single Camoufox process without cross-context correlation.
 
 ### What's New

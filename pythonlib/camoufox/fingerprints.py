@@ -1096,6 +1096,8 @@ def generate_context_fingerprint(
 
     # Apply caller overrides before rendering init_script
     if config_overrides:
+        from .seeds import validate_seed_options
+        validate_seed_options(config_overrides)
         config.update(config_overrides)
 
     # Build the values dict for the init script (works for both paths)

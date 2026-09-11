@@ -1,0 +1,561 @@
+diff --git a/dom/base/AudioFingerprintManager.cpp b/dom/base/AudioFingerprintManager.cpp
+--- a/dom/base/AudioFingerprintManager.cpp
++++ b/dom/base/AudioFingerprintManager.cpp
+@@ -3,6 +3,7 @@
+ #include "nsHashKeys.h"  // For nsStringHashKey
+ #include "RoverfoxStorageManager.h"
+ #include "MaskConfig.hpp"
++#include "AudioSeed.hpp"
+ #include "nsGlobalWindowInner.h"
+ #include "xpcpublic.h"
+ #include "mozilla/dom/BrowsingContext.h"
+@@ -37,7 +38,7 @@
+   nsString key;
+   key.AppendPrintf("audioFingerprintSeed_%u", aUserContextId);
+   uint32_t seed = 0;
+-  if (RoverfoxStorageManager::GetUint(key, seed) && seed != 0) {
++  if (RoverfoxStorageManager::GetUint(key, seed)) {
+     return seed;
+   }
+   // Fallback to CAMOU_CONFIG for Workers in separate processes
+@@ -48,23 +49,17 @@
+ }
+ 
+ /* static */ void
+-AudioFingerprintManager::ApplyTransformation(float* data, uint32_t length, uint32_t seed) {
++AudioFingerprintManager::ApplyTransformation(float* data, uint32_t length,
++                                              uint32_t seed, uint32_t offset) {
+   if (seed == 0 || length == 0 || !data) {
+     return;
+   }
+   // LCG for deterministic transformation - same seed always produces same result
+   // Uses 0.8% variance (range [0.996, 1.004]) with non-linear polynomial component
+   // This is more robust than Brave's 0.1-0.2% variance which was bypassed
+-  uint32_t state = seed;
++  uint32_t state = camoufox::AudioSeedState(seed, offset);
+   for (uint32_t i = 0; i < length; ++i) {
+-    state = (state * 1664525u + 1013904223u);
+-    float normalized = static_cast<float>(state) / 4294967295.0f;
+-    // Linear base: 0.8% variance
+-    float base = 0.996f + normalized * 0.008f;
+-    // Non-linear polynomial adjustment - makes reverse-engineering harder
+-    float adjustment = (normalized * normalized - 0.5f) * 0.002f;
+-    float multiplier = base + adjustment;
+-    data[i] *= multiplier;
++    data[i] *= camoufox::AudioSeedMultiplier(state);
+   }
+ }
+ 
+diff --git a/dom/base/AudioFingerprintManager.h b/dom/base/AudioFingerprintManager.h
+--- a/dom/base/AudioFingerprintManager.h
++++ b/dom/base/AudioFingerprintManager.h
+@@ -15,7 +15,8 @@
+   static void SetSeed(uint32_t aUserContextId, uint32_t aSeed);
+   static uint32_t GetSeed(uint32_t aUserContextId);
+ 
+-  static void ApplyTransformation(float* data, uint32_t length, uint32_t seed);
++  static void ApplyTransformation(float* data, uint32_t length, uint32_t seed,
++                                  uint32_t offset = 0);
+   static void ApplyTransformationToBytes(uint8_t* data, uint32_t length, uint32_t seed);
+ 
+   static void DisableFunction(uint32_t userContextId);
+diff --git a/dom/base/FontSpacingSeedManager.cpp b/dom/base/FontSpacingSeedManager.cpp
+--- a/dom/base/FontSpacingSeedManager.cpp
++++ b/dom/base/FontSpacingSeedManager.cpp
+@@ -40,7 +40,7 @@
+ FontSpacingSeedManager::GetSeed(uint32_t userContextId) {
+   nsString key = KeyForUserContext(userContextId);
+   uint32_t seed = 0;
+-  if (RoverfoxStorageManager::GetUint(key, seed) && seed != 0) {
++  if (RoverfoxStorageManager::GetUint(key, seed)) {
+     return seed;
+   }
+   // Fallback to CAMOU_CONFIG for Workers in separate processes
+@@ -91,4 +91,4 @@
+ }
+ 
+ } // namespace dom
+-} // namespace mozilla
+\ No newline at end of file
++} // namespace mozilla
+diff --git a/dom/base/RoverfoxStorageManager.cpp b/dom/base/RoverfoxStorageManager.cpp
+--- a/dom/base/RoverfoxStorageManager.cpp
++++ b/dom/base/RoverfoxStorageManager.cpp
+@@ -34,9 +34,9 @@
+     MutexAutoLock lock(GetLocalCacheMutex());
+     GetLocalCache().InsertOrUpdate(prefName, nsCString(value));
+   }
+-  // Sync to parent for cross-process availability
++  // Runtime defaults sync across processes without persisting old contexts/IDs.
+   if (XRE_IsParentProcess()) {
+-    Preferences::SetCString(prefName.get(), value);
++    Preferences::SetCString(prefName.get(), value, PrefValueKind::Default);
+   } else {
+     ContentChild* cc = ContentChild::GetSingleton();
+     if (cc) {
+@@ -66,7 +66,7 @@
+   }
+   // Fall back to Preferences (values synced from other processes)
+   if (strValue.IsEmpty()) {
+-    Preferences::GetCString(prefName.get(), strValue);
++    Preferences::GetCString(prefName.get(), strValue, PrefValueKind::Default);
+   }
+   // Sync IPC read from parent (cross-process fallback for workers)
+   if (strValue.IsEmpty() && !XRE_IsParentProcess() && NS_IsMainThread()) {
+@@ -82,7 +82,7 @@
+   if (!strValue.IsEmpty()) {
+     nsresult parseRv;
+     int64_t parsed = strValue.ToInteger64(&parseRv);
+-    if (NS_SUCCEEDED(parseRv) && parsed >= 0) {
++    if (NS_SUCCEEDED(parseRv) && parsed >= 0 && parsed <= UINT32_MAX) {
+       outValue = static_cast<uint32_t>(parsed);
+       return true;
+     }
+@@ -108,7 +108,7 @@
+     }
+   }
+   if (strValue.IsEmpty()) {
+-    Preferences::GetCString(prefName.get(), strValue);
++    Preferences::GetCString(prefName.get(), strValue, PrefValueKind::Default);
+   }
+   // Sync IPC read from parent (cross-process fallback for workers)
+   if (strValue.IsEmpty() && !XRE_IsParentProcess() && NS_IsMainThread()) {
+@@ -148,7 +148,7 @@
+     }
+   }
+   if (utf8Value.IsEmpty()) {
+-    Preferences::GetCString(prefName.get(), utf8Value);
++    Preferences::GetCString(prefName.get(), utf8Value, PrefValueKind::Default);
+   }
+   // Sync IPC read from parent (cross-process fallback for workers)
+   if (utf8Value.IsEmpty() && !XRE_IsParentProcess() && NS_IsMainThread()) {
+@@ -176,7 +176,7 @@
+     GetLocalCache().Remove(prefName);
+   }
+   if (XRE_IsParentProcess()) {
+-    Preferences::ClearUser(prefName.get());
++    Preferences::SetCString(prefName.get(), EmptyCString(), PrefValueKind::Default);
+   }
+ }
+ 
+diff --git a/dom/canvas/CanvasRenderingContext2D.cpp b/dom/canvas/CanvasRenderingContext2D.cpp
+--- a/dom/canvas/CanvasRenderingContext2D.cpp
++++ b/dom/canvas/CanvasRenderingContext2D.cpp
+@@ -4776,16 +4776,20 @@
+     } else {
+       flags &= ~gfx::ShapedTextFlags::TEXT_IS_RTL;
+     }
+-    // Extract user context ID via BrowsingContext (canonical source)
++    // HTMLCanvasElement and main-thread OffscreenCanvas share their owning
++    // global. Worker canvases get the same container identity from the native
++    // Worker origin attributes instead of silently using the launch seed.
+     uint32_t userContextId = 0;
+-    if (mCtx && mCtx->mCanvasElement) {
+-      if (Document* doc = mCtx->mCanvasElement->GetOwnerDocument()) {
+-        if (nsPIDOMWindowInner* win = doc->GetInnerWindow()) {
++    if (NS_IsMainThread()) {
++      if (nsIGlobalObject* global = mCtx ? mCtx->GetParentObject() : nullptr) {
++        if (nsPIDOMWindowInner* win = global->GetAsInnerWindow()) {
+           if (BrowsingContext* bc = win->GetBrowsingContext()) {
+             userContextId = bc->OriginAttributesRef().mUserContextId;
+           }
+         }
+       }
++    } else if (WorkerPrivate* worker = GetCurrentThreadWorkerPrivate()) {
++      userContextId = worker->GetOriginAttributes().mUserContextId;
+     }
+     mTextRun = mFontgrp->MakeTextRun(
+         aText, aLength, mDrawTarget, mAppUnitsPerDevPixel, flags,
+diff --git a/dom/ipc/ContentParent.cpp b/dom/ipc/ContentParent.cpp
+--- a/dom/ipc/ContentParent.cpp
++++ b/dom/ipc/ContentParent.cpp
+@@ -1271,7 +1271,7 @@
+   if (!StringBeginsWith(aPrefName, "roverfox.s."_ns)) {
+     return IPC_OK();
+   }
+-  Preferences::SetCString(aPrefName.get(), aValue);
++  Preferences::SetCString(aPrefName.get(), aValue, PrefValueKind::Default);
+   return IPC_OK();
+ }
+ 
+@@ -1281,7 +1281,7 @@
+     *aOutValue = ""_ns;
+     return IPC_OK();
+   }
+-  Preferences::GetCString(aPrefName.get(), *aOutValue);
++  Preferences::GetCString(aPrefName.get(), *aOutValue, PrefValueKind::Default);
+   return IPC_OK();
+ }
+ 
+diff --git a/dom/media/webaudio/AnalyserNode.cpp b/dom/media/webaudio/AnalyserNode.cpp
+--- a/dom/media/webaudio/AnalyserNode.cpp
++++ b/dom/media/webaudio/AnalyserNode.cpp
+@@ -12,6 +12,7 @@
+ #include "mozilla/dom/AnalyserNodeBinding.h"
+ #include "nsMathUtils.h"
+ #include "AudioFingerprintManager.h"
++#include "AudioSeed.hpp"
+ #include "nsPIDOMWindow.h"
+ #include "nsIGlobalObject.h"
+ #include "mozilla/dom/BrowsingContext.h"
+@@ -27,6 +28,18 @@
+               "CHUNK_COUNT must be power of 2 for remainder behavior");
+ 
+ namespace dom {
++
++static uint32_t GetAnalyserFingerprintSeed(AudioContext* context) {
++  uint32_t userContextId = 0;
++  nsIGlobalObject* global = context ? context->GetParentObject() : nullptr;
++  if (auto* window = global ? global->GetAsInnerWindow() : nullptr) {
++    if (auto* bc = window->GetBrowsingContext())
++      userContextId = bc->OriginAttributesRef().mUserContextId;
++  } else if (auto* worker = GetCurrentThreadWorkerPrivate()) {
++    userContextId = worker->GetOriginAttributes().mUserContextId;
++  }
++  return AudioFingerprintManager::GetSeed(userContextId);
++}
+ 
+ class AnalyserNodeEngine final : public AudioNodeEngine {
+   class TransferBuffer final : public Runnable {
+@@ -219,30 +232,17 @@
+     return;
+   }
+ 
+-  // Apply audio fingerprint transformation to frequency data
+-  {
+-    uint32_t userContextId = 0;
+-    AudioContext* context = GetParentObject();
+-    nsIGlobalObject* globalObj = context ? context->GetParentObject() : nullptr;
+-    nsPIDOMWindowInner* global = globalObj ? globalObj->GetAsInnerWindow() : nullptr;
+-    if (global) {
+-      if (BrowsingContext* bc = global->GetBrowsingContext()) {
+-        userContextId = bc->OriginAttributesRef().mUserContextId;
+-      }
+-    } else if (WorkerPrivate* wp = GetCurrentThreadWorkerPrivate()) {
+-      userContextId = wp->GetOriginAttributes().mUserContextId;
+-    }
+-    uint32_t seed = AudioFingerprintManager::GetSeed(userContextId);
+-    if (seed != 0) {
+-      AudioFingerprintManager::ApplyTransformation(mOutputBuffer.Elements(), mOutputBuffer.Length(), seed);
+-    }
+-  }
++  // Perturb the exported values, never the FFT smoothing history.
++  const uint32_t seed = GetAnalyserFingerprintSeed(GetParentObject());
+   aArray.ProcessData([&](const Span<float>& aData, JS::AutoCheckCannotGC&&) {
+     size_t length = std::min(size_t(aData.Length()), mOutputBuffer.Length());
++    uint32_t state = seed;
+ 
+     for (size_t i = 0; i < length; ++i) {
++      const float magnitude = seed ? mOutputBuffer[i] * camoufox::AudioSeedMultiplier(state)
++                                   : mOutputBuffer[i];
+       aData[i] = WebAudioUtils::ConvertLinearToDecibels(
+-          mOutputBuffer[i], -std::numeric_limits<float>::infinity());
++          magnitude, -std::numeric_limits<float>::infinity());
+     }
+   });
+ }
+@@ -253,32 +253,18 @@
+     return;
+   }
+ 
+-  // Apply audio fingerprint transformation to frequency data
+-  {
+-    uint32_t userContextId = 0;
+-    AudioContext* context = GetParentObject();
+-    nsIGlobalObject* globalObj = context ? context->GetParentObject() : nullptr;
+-    nsPIDOMWindowInner* global = globalObj ? globalObj->GetAsInnerWindow() : nullptr;
+-    if (global) {
+-      if (BrowsingContext* bc = global->GetBrowsingContext()) {
+-        userContextId = bc->OriginAttributesRef().mUserContextId;
+-      }
+-    } else if (WorkerPrivate* wp = GetCurrentThreadWorkerPrivate()) {
+-      userContextId = wp->GetOriginAttributes().mUserContextId;
+-    }
+-    uint32_t seed = AudioFingerprintManager::GetSeed(userContextId);
+-    if (seed != 0) {
+-      AudioFingerprintManager::ApplyTransformation(mOutputBuffer.Elements(), mOutputBuffer.Length(), seed);
+-    }
+-  }
++  const uint32_t seed = GetAnalyserFingerprintSeed(GetParentObject());
+   const double rangeScaleFactor = 1.0 / (mMaxDecibels - mMinDecibels);
+ 
+   aArray.ProcessData([&](const Span<uint8_t>& aData, JS::AutoCheckCannotGC&&) {
+     size_t length = std::min(size_t(aData.Length()), mOutputBuffer.Length());
++    uint32_t state = seed;
+ 
+     for (size_t i = 0; i < length; ++i) {
++      const float magnitude = seed ? mOutputBuffer[i] * camoufox::AudioSeedMultiplier(state)
++                                   : mOutputBuffer[i];
+       const double decibels = WebAudioUtils::ConvertLinearToDecibels(
+-          mOutputBuffer[i], mMinDecibels);
++          magnitude, mMinDecibels);
+       // scale down the value to the range of [0, UCHAR_MAX]
+       const double scaled = std::max(
+           0.0,
+diff --git a/dom/media/webaudio/AudioBuffer.cpp b/dom/media/webaudio/AudioBuffer.cpp
+--- a/dom/media/webaudio/AudioBuffer.cpp
++++ b/dom/media/webaudio/AudioBuffer.cpp
+@@ -316,7 +316,7 @@
+       }
+       // Seed lookup runs even when global is null (workers get ucid=0 fallback)
+       uint32_t seed = AudioFingerprintManager::GetSeed(userContextId);
+-      if (seed != 0) {
++      if (seed != 0 && !mSharedChannelsTransformed) {
+         JS::AutoCheckCannotGC nogc;
+         bool isShared;
+         float* jsData = JS_GetFloat32ArrayData(array, &isShared, nogc);
+@@ -389,9 +389,9 @@
+         }
+         // Seed lookup runs even when global is null (workers get ucid=0 fallback)
+         uint32_t seed = AudioFingerprintManager::GetSeed(userContextId);
+-        if (seed != 0) {
++        if (seed != 0 && !mSharedChannelsTransformed) {
+           AudioFingerprintManager::ApplyTransformation(
+-              aData.Elements(), calculateCount(aData.Length()), seed);
++              aData.Elements(), calculateCount(aData.Length()), seed, aBufferOffset);
+         }
+       }
+     });
+@@ -523,6 +523,7 @@
+ 
+     if (buffer) {
+       SetSharedChannels(buffer.forget());
++      mSharedChannelsTransformed = true;
+     }
+   }
+ 
+diff --git a/dom/media/webaudio/AudioBuffer.h b/dom/media/webaudio/AudioBuffer.h
+--- a/dom/media/webaudio/AudioBuffer.h
++++ b/dom/media/webaudio/AudioBuffer.h
+@@ -124,6 +124,8 @@
+   // member keeps the buffer length regardless of whether the buffer is
+   // provided by mJSChannels or mSharedChannels.
+   AudioChunk mSharedChannels;
++  // Acquiring JS channel data for playback must not apply its seed twice.
++  bool mSharedChannelsTransformed = false;
+ 
+   nsWeakPtr mOwnerWindow;
+   float mSampleRate;
+diff --git a/gfx/thebes/gfxFont.cpp b/gfx/thebes/gfxFont.cpp
+--- a/gfx/thebes/gfxFont.cpp
++++ b/gfx/thebes/gfxFont.cpp
+@@ -3311,8 +3311,13 @@
+     gfx::ShapedTextFlags aFlags, RoundingFlags aRounding,
+     gfxTextPerfMetrics* aTextPerf GFX_MAYBE_UNUSED,
+     uint32_t aUserContextId, Func aCallback) {
++  // The same context can be shaped before its init script supplies a seed.
++  // Do not reuse shapes from that earlier (or explicitly zero) configuration.
++  const uint32_t spacingSeed =
++      mozilla::dom::FontSpacingSeedManager::GetSeed(aUserContextId);
+   WordCacheKey key(aText, aLength, aHash, aRunScript, aLanguage,
+-                   aAppUnitsPerDevUnit, aFlags, aRounding, aUserContextId);
++                   aAppUnitsPerDevUnit, aFlags, aRounding, aUserContextId,
++                   spacingSeed);
+   {
+     // If we have a word cache, attempt to look up the word in it.
+     AutoReadLock lock(mLock);
+@@ -3402,7 +3407,8 @@
+       aKey.mRounding != aLookup.mRounding ||
+       aKey.mAppUnitsPerDevUnit != aLookup.mAppUnitsPerDevUnit ||
+       aKey.mScript != aLookup.mScript || aKey.mLanguage != aLookup.mLanguage ||
+-      aKey.mUserContextId != aLookup.mUserContextId) {
++      aKey.mUserContextId != aLookup.mUserContextId ||
++      aKey.mFontSpacingSeed != aLookup.mFontSpacingSeed) {
+     return false;
+   }
+ 
+@@ -3433,13 +3439,13 @@
+ 
+ bool gfxFont::ProcessSingleSpaceShapedWord(
+     bool aVertical, int32_t aAppUnitsPerDevUnit, gfx::ShapedTextFlags aFlags,
+-    RoundingFlags aRounding,
++    RoundingFlags aRounding, uint32_t aUserContextId,
+     const std::function<void(gfxShapedWord*)>& aCallback) {
+   static const uint8_t space = ' ';
+   return ProcessShapedWordInternal(
+       &space, 1, gfxShapedWord::HashMix(0, ' '), Script::LATIN,
+       /* aLanguage = */ nullptr, aVertical, aAppUnitsPerDevUnit, aFlags,
+-      aRounding, nullptr, 0 /* pbid */, aCallback);
++      aRounding, nullptr, aUserContextId, aCallback);
+ }
+ 
+ bool gfxFont::ShapeText(const uint8_t* aText, uint32_t aOffset,
+diff --git a/gfx/thebes/gfxFont.h b/gfx/thebes/gfxFont.h
+--- a/gfx/thebes/gfxFont.h
++++ b/gfx/thebes/gfxFont.h
+@@ -1899,6 +1899,7 @@
+   bool ProcessSingleSpaceShapedWord(
+       bool aVertical, int32_t aAppUnitsPerDevUnit,
+       mozilla::gfx::ShapedTextFlags aFlags, RoundingFlags aRounding,
++      uint32_t aUserContextId,
+       const std::function<void(gfxShapedWord*)>& aCallback);
+ 
+   // Called by the gfxFontCache timer to increment the age of all the words,
+@@ -2199,12 +2200,14 @@
+     PLDHashNumber mHashKey;
+     bool mTextIs8Bit;
+     uint32_t mUserContextId;
++    uint32_t mFontSpacingSeed;
+     RoundingFlags mRounding;
+ 
+     WordCacheKey(const uint8_t* aText, uint32_t aLength, uint32_t aStringHash,
+                  Script aScriptCode, nsAtom* aLanguage,
+                  int32_t aAppUnitsPerDevUnit, ShapedTextFlags aFlags,
+-                 RoundingFlags aRounding, uint32_t aUserContextId = 0)
++                 RoundingFlags aRounding, uint32_t aUserContextId,
++                 uint32_t aFontSpacingSeed)
+         : mLength(aLength),
+           mFlags(aFlags),
+           mScript(aScriptCode),
+@@ -2212,9 +2215,11 @@
+           mAppUnitsPerDevUnit(aAppUnitsPerDevUnit),
+           mHashKey(aStringHash + static_cast<int32_t>(aScriptCode) +
+                    aAppUnitsPerDevUnit * 0x100 + uint16_t(aFlags) * 0x10000 +
+-                   int(aRounding) + (aLanguage ? aLanguage->hash() : 0) + aUserContextId * 0x1000000),
++                   int(aRounding) + (aLanguage ? aLanguage->hash() : 0) +
++                   aUserContextId * 0x1000000 + aFontSpacingSeed),
+           mTextIs8Bit(true),
+           mUserContextId(aUserContextId),
++          mFontSpacingSeed(aFontSpacingSeed),
+           mRounding(aRounding) {
+       NS_ASSERTION(aFlags & ShapedTextFlags::TEXT_IS_8BIT,
+                    "8-bit flag should have been set");
+@@ -2224,7 +2229,8 @@
+     WordCacheKey(const char16_t* aText, uint32_t aLength, uint32_t aStringHash,
+                  Script aScriptCode, nsAtom* aLanguage,
+                  int32_t aAppUnitsPerDevUnit, ShapedTextFlags aFlags,
+-                 RoundingFlags aRounding, uint32_t aUserContextId = 0)
++                 RoundingFlags aRounding, uint32_t aUserContextId,
++                 uint32_t aFontSpacingSeed)
+         : mLength(aLength),
+           mFlags(aFlags),
+           mScript(aScriptCode),
+@@ -2232,9 +2238,11 @@
+           mAppUnitsPerDevUnit(aAppUnitsPerDevUnit),
+           mHashKey(aStringHash + static_cast<int32_t>(aScriptCode) +
+                    aAppUnitsPerDevUnit * 0x100 + uint16_t(aFlags) * 0x10000 +
+-                   int(aRounding) + aUserContextId * 0x1000000),
++                   int(aRounding) + (aLanguage ? aLanguage->hash() : 0) +
++                   aUserContextId * 0x1000000 + aFontSpacingSeed),
+           mTextIs8Bit(false),
+           mUserContextId(aUserContextId),
++          mFontSpacingSeed(aFontSpacingSeed),
+           mRounding(aRounding) {
+       // We can NOT assert that TEXT_IS_8BIT is false in aFlags here,
+       // because this might be an 8bit-only word from a 16-bit textrun,
+diff --git a/gfx/thebes/gfxPlatformFontList.cpp b/gfx/thebes/gfxPlatformFontList.cpp
+--- a/gfx/thebes/gfxPlatformFontList.cpp
++++ b/gfx/thebes/gfxPlatformFontList.cpp
+@@ -1503,7 +1503,10 @@
+                                  family.Key().AsString(SharedFontList()))) {
+           continue;
+         }
+-        if (!family.IsFullyInitialized() &&
++        // A configured font list must select the same fallback before and
++        // after cmap warm-up. Skipping a not-yet-loaded allowed family makes
++        // text widths depend on which other page happened to use it first.
++        if (!maskedFontList && !family.IsFullyInitialized() &&
+             StaticPrefs::gfx_font_rendering_fallback_async() &&
+             !XRE_IsParentProcess()) {
+           // Start loading all the missing charmaps; but this is async,
+diff --git a/gfx/thebes/gfxTextRun.cpp b/gfx/thebes/gfxTextRun.cpp
+--- a/gfx/thebes/gfxTextRun.cpp
++++ b/gfx/thebes/gfxTextRun.cpp
+@@ -1548,7 +1548,7 @@
+   gfxFontShaper::RoundingFlags roundingFlags =
+       aFont->GetRoundOffsetsToPixels(aDrawTarget);
+   aFont->ProcessSingleSpaceShapedWord(
+-      vertical, mAppUnitsPerDevUnit, flags, roundingFlags,
++      vertical, mAppUnitsPerDevUnit, flags, roundingFlags, GetUserContextId(),
+       [&](gfxShapedWord* aShapedWord) {
+         const GlyphRun* prevRun = TrailingGlyphRun();
+         bool isCJK = prevRun && prevRun->mFont == aFont &&
+diff --git a/toolkit/components/resistfingerprinting/moz.build b/toolkit/components/resistfingerprinting/moz.build
+--- a/toolkit/components/resistfingerprinting/moz.build
++++ b/toolkit/components/resistfingerprinting/moz.build
+@@ -34,6 +34,8 @@
+ SPHINX_TREES["resistfingerprinting"] = "docs"
+ 
+ FINAL_LIBRARY = "xul"
++
++LOCAL_INCLUDES += ["/camoucfg"]
+ 
+ EXPORTS += [
+     "FontVisibilityProvider.h",
+diff --git a/toolkit/components/resistfingerprinting/nsRFPService.cpp b/toolkit/components/resistfingerprinting/nsRFPService.cpp
+--- a/toolkit/components/resistfingerprinting/nsRFPService.cpp
++++ b/toolkit/components/resistfingerprinting/nsRFPService.cpp
+@@ -3,6 +3,7 @@
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+ #include "nsRFPService.h"
++#include "MaskFingerprint.hpp"
+ 
+ #include <algorithm>
+ #include <cfloat>
+@@ -1357,8 +1358,37 @@
+     return NS_OK;
+   }
+ 
+-  nsID& newKey =
+-      mBrowsingSessionKeys.InsertOrUpdate(oaSuffix, nsID::GenerateUUID());
++  nsID key;
++  if (const auto seed = MaskConfig::GetFingerprintSeeds().Canvas();
++      seed && *seed != 0) {
++    // Keep the native permission, partitioning, IPC and image-extraction paths.
++    // Only the per-launch root changes when an explicit stable seed exists.
++    // Encoding is endian-independent and contains no profile path, clock or PID.
++    const uint8_t seedBytes[] = {uint8_t(*seed >> 24), uint8_t(*seed >> 16),
++                                 uint8_t(*seed >> 8), uint8_t(*seed)};
++    HMAC hmac;
++    nsresult rv = hmac.Begin(SEC_OID_SHA256, Span(seedBytes));
++    NS_ENSURE_SUCCESS(rv, rv);
++    constexpr char domain[] = "camoufox:canvas-seed:v1";
++    rv = hmac.Update(reinterpret_cast<const uint8_t*>(domain), sizeof(domain));
++    NS_ENSURE_SUCCESS(rv, rv);
++    rv = hmac.Update(reinterpret_cast<const uint8_t*>(oaSuffix.get()),
++                     oaSuffix.Length());
++    NS_ENSURE_SUCCESS(rv, rv);
++    nsTArray<uint8_t> digest;
++    rv = hmac.End(digest);
++    NS_ENSURE_SUCCESS(rv, rv);
++    MOZ_RELEASE_ASSERT(digest.Length() >= 16);
++    key.m0 = uint32_t(digest[0]) << 24 | uint32_t(digest[1]) << 16 |
++             uint32_t(digest[2]) << 8 | digest[3];
++    key.m1 = uint16_t(digest[4]) << 8 | digest[5];
++    key.m2 = uint16_t(digest[6]) << 8 | digest[7];
++    for (size_t i = 0; i < 8; ++i) key.m3[i] = digest[i + 8];
++  } else {
++    // Omitted/zero seed opts out of stable keying; it does not disable RFP.
++    key = nsID::GenerateUUID();
++  }
++  nsID& newKey = mBrowsingSessionKeys.InsertOrUpdate(oaSuffix, key);
+ 
+   MOZ_LOG(gResistFingerprintingLog, LogLevel::Debug,
+           ("Generated browsing session key: %s\n", newKey.ToString().get()));
+diff --git a/toolkit/xre/nsAppRunner.cpp b/toolkit/xre/nsAppRunner.cpp
+--- a/toolkit/xre/nsAppRunner.cpp
++++ b/toolkit/xre/nsAppRunner.cpp
+@@ -22,6 +22,7 @@
+ #include "mozilla/Logging.h"
+ #include "mozilla/Preferences.h"
+ #include "MaskGraphics.hpp"
++#include "MaskFingerprint.hpp"
+ #include "mozilla/PreferenceSheet.h"
+ #include "mozilla/Printf.h"
+ #include "mozilla/ProcessType.h"
+@@ -6075,6 +6076,13 @@
+  *            .app/Contents/Resources.
+  */
+ int XREMain::XRE_main(int argc, char* argv[], const BootstrapConfig& aConfig) {
++  const auto& fingerprintSeeds = MaskConfig::GetFingerprintSeeds();
++  if (!fingerprintSeeds.Errors().empty()) {
++    for (const auto& error : fingerprintSeeds.Errors()) {
++      fprintf(stderr, "ERROR: Camoufox fingerprint configuration: %s\n", error.c_str());
++    }
++    return 1;
++  }
+   // Reject invalid launch data before initializing XPCOM/profile services;
+   // returning from XRE_mainRun that early cannot perform normal teardown.
+   const auto& graphicsConfig = MaskConfig::GetGraphicsConfig();
+
