@@ -5,6 +5,7 @@ Written by daijro.
 
 #pragma once
 #include "json.hpp"
+#include "WindowResolution.hpp"
 #include <memory>
 #include <string>
 #include <string_view>
@@ -90,6 +91,17 @@ inline const nlohmann::json& GetJson() {
 
 inline bool HasKey(const std::string& key, const nlohmann::json& data) {
   return data.contains(key);
+}
+
+inline const camoufox::WindowResolution& GetWindowResolution() {
+  static const auto resolution = [] {
+    auto value = camoufox::WindowResolution::Resolve(GetJson());
+    for (const auto& error : value.Errors()) {
+      printf_stderr("ERROR: Window resolution: %s\n", error.c_str());
+    }
+    return value;
+  }();
+  return resolution;
 }
 
 inline std::optional<std::string> GetString(const std::string& key) {

@@ -1,0 +1,751 @@
+diff --git a/dom/webgpu/Adapter.cpp b/dom/webgpu/Adapter.cpp
+--- a/dom/webgpu/Adapter.cpp
++++ b/dom/webgpu/Adapter.cpp
+@@ -3,6 +3,7 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "Adapter.h"
++#include "MaskGraphics.hpp"
+ 
+ #include <algorithm>
+ #include <bit>
+@@ -22,7 +23,33 @@
+ GPU_IMPL_CYCLE_COLLECTION(AdapterInfo, mParent)
+ GPU_IMPL_JS_WRAP(AdapterInfo)
+ 
++static const nlohmann::json* ProfileInfo(const AdapterInfo* info) {
++  const auto* profile = info->Profile();
++  if (!profile || !profile->values.contains("info")) return nullptr;
++  return &profile->values["info"];
++}
++
++static void ProfileString(const AdapterInfo* info, const char* key, nsString& out) {
++  const auto* values = ProfileInfo(info);
++  out.Truncate();
++  if (values && values->contains(key)) {
++    const auto value = (*values)[key].get<std::string>();
++    CopyUTF8toUTF16(nsDependentCString(value.data(), value.size()), out);
++  }
++}
++
++void AdapterInfo::GetVendor(nsString& out) const { ProfileString(this, "vendor", out); }
++void AdapterInfo::GetArchitecture(nsString& out) const { ProfileString(this, "architecture", out); }
++void AdapterInfo::GetDevice(nsString& out) const { ProfileString(this, "device", out); }
++void AdapterInfo::GetDescription(nsString& out) const { ProfileString(this, "description", out); }
++
++const camoufox::AdapterProfile* AdapterInfo::Profile() const {
++  return mParent->Profile();
++}
++
+ uint32_t AdapterInfo::SubgroupMinSize() const {
++  if (const auto* info = ProfileInfo(this); info && info->contains("subgroupMinSize"))
++    return (*info)["subgroupMinSize"].get<uint32_t>();
+   // From the spec. at
+   // <https://www.w3.org/TR/2025/CRD-webgpu-20250319/#dom-gpuadapterinfo-subgroupminsize>:
+   //
+@@ -46,6 +73,8 @@
+ }
+ 
+ uint32_t AdapterInfo::SubgroupMaxSize() const {
++  if (const auto* info = ProfileInfo(this); info && info->contains("subgroupMaxSize"))
++    return (*info)["subgroupMaxSize"].get<uint32_t>();
+   // From the spec. at
+   // <https://www.w3.org/TR/2025/CRD-webgpu-20250319/#dom-gpuadapterinfo-subgroupmaxsize>:
+   //
+@@ -69,6 +98,8 @@
+ }
+ 
+ bool AdapterInfo::IsFallbackAdapter() const {
++  if (const auto* info = ProfileInfo(this); info && info->contains("isFallbackAdapter"))
++    return (*info)["isFallbackAdapter"].get<bool>();
+   if (GetParentObject()->ShouldResistFingerprinting(
+           RFPTarget::WebGPUIsFallbackAdapter)) {
+     // Always report hardware support for WebGPU.
+@@ -422,6 +453,98 @@
+   MOZ_CRASH("Bad Limit");
+ }
+ 
++bool Adapter::ApplyProfile(
++    std::shared_ptr<const camoufox::AdapterProfile> profile) {
++  if (!profile || profile->values.empty()) return true;
++  const auto& values = profile->values;
++  const auto fail = [](const std::string& reason) {
++    printf_stderr("ERROR: Camoufox WebGPU profile: %s\n", reason.c_str());
++    return false;
++  };
++
++  if (values.contains("info")) {
++    const auto& info = values["info"];
++    if (profile->forceFallbackAdapter && info.contains("isFallbackAdapter") &&
++        !info["isFallbackAdapter"].get<bool>())
++      return fail("forceFallbackAdapter request requires isFallbackAdapter=true");
++    // Firefox 152 does not implement the subgroups feature. Preserve its
++    // defined 4/128 fallback instead of claiming unimplemented subgroup sizes.
++    if (info.contains("subgroupMinSize") && info["subgroupMinSize"] != 4)
++      return fail("subgroupMinSize must be 4 without implemented subgroups");
++    if (info.contains("subgroupMaxSize") && info["subgroupMaxSize"] != 128)
++      return fail("subgroupMaxSize must be 128 without implemented subgroups");
++  }
++
++  RefPtr<SupportedFeatures> features = mFeatures;
++  if (values.contains("features")) {
++    features = new SupportedFeatures(this);
++    IgnoredErrorResult rv;
++    for (const auto& entry : values["features"]) {
++      const auto name = entry.get<std::string>();
++      bool found = false;
++      for (const auto feature : dom::MakeWebIDLEnumeratedRange<dom::GPUFeatureName>()) {
++        if (dom::GetEnumString(feature).Equals(name.c_str())) {
++          if (!mFeatures->Features().count(feature))
++            return fail("feature is not executable on this adapter: " + name);
++          features->Add(feature, rv);
++          found = true;
++          break;
++        }
++      }
++      if (!found) return fail("unknown feature: " + name);
++    }
++    const auto& set = features->Features();
++    if (!set.count(dom::GPUFeatureName::Core_features_and_limits))
++      return fail("features must include core-features-and-limits");
++    if (set.count(dom::GPUFeatureName::Texture_compression_bc_sliced_3d) &&
++        !set.count(dom::GPUFeatureName::Texture_compression_bc))
++      return fail("texture-compression-bc-sliced-3d requires texture-compression-bc");
++    if (set.count(dom::GPUFeatureName::Texture_compression_astc_sliced_3d) &&
++        !set.count(dom::GPUFeatureName::Texture_compression_astc))
++      return fail("texture-compression-astc-sliced-3d requires texture-compression-astc");
++  }
++
++  auto effective = *mLimits->mFfi;
++  if (values.contains("limits")) {
++    ffi::WGPULimits defaults = {};
++    ffi::wgpu_client_fill_default_limits(&defaults);
++    const auto& configured = values["limits"];
++    for (const auto limit : MakeInclusiveEnumeratedRange(Limit::_LAST)) {
++      const std::string key(ToJsKey(limit));
++      if (!configured.contains(key)) continue;
++      const auto value = configured[key].get<uint64_t>();
++      const auto supported = GetLimit(mInfoInner->limits, limit);
++      const auto baseline = GetLimit(defaults, limit);
++      if (key.rfind("max", 0) == 0) {
++        if (value > supported || value < baseline)
++          return fail(key + " must be between the core default and backend capacity");
++      } else {
++        if (value < supported || value > baseline || !std::has_single_bit(value))
++          return fail(key + " must be a supported power-of-two alignment");
++      }
++      SetLimit(&effective, limit, value);
++    }
++    // These fields are aliases in Firefox 152 / its wgpu Limits structure.
++    // Validate the shared constraint instead of exposing unenforceable values.
++    for (const auto limit : {Limit::MaxStorageBuffersInVertexStage,
++                             Limit::MaxStorageBuffersInFragmentStage,
++                             Limit::MaxStorageTexturesInVertexStage,
++                             Limit::MaxStorageTexturesInFragmentStage}) {
++      const std::string key(ToJsKey(limit));
++      if (configured.contains(key) && configured[key].get<uint64_t>() != GetLimit(effective, limit))
++        return fail(key + " must equal its PerShaderStage limit in Firefox 152");
++    }
++    if (effective.max_uniform_buffer_binding_size > effective.max_buffer_size ||
++        effective.max_storage_buffer_binding_size > effective.max_buffer_size)
++      return fail("buffer binding sizes must not exceed maxBufferSize");
++  }
++
++  mFeatures = std::move(features);
++  *mLimits->mFfi = effective;
++  mProfile = std::move(profile);
++  return true;
++}
++
+ uint64_t Adapter::MissingFeatures() const {
+   uint64_t missingFeatures = 0;
+ 
+diff --git a/dom/webgpu/Adapter.h b/dom/webgpu/Adapter.h
+--- a/dom/webgpu/Adapter.h
++++ b/dom/webgpu/Adapter.h
+@@ -13,6 +13,10 @@
+ #include "mozilla/webgpu/WebGPUTypes.h"
+ #include "nsPrintfCString.h"
+ #include "nsString.h"
++
++namespace camoufox {
++struct AdapterProfile;
++}
+ 
+ namespace mozilla {
+ class ErrorResult;
+@@ -57,13 +61,14 @@
+   /// Changing implementation in a way that increases fingerprinting
+   /// surface? Please create a bug in [Core::Privacy: Anti
+   /// Tracking](https://bugzilla.mozilla.org/enter_bug.cgi?product=Core&component=Privacy%3A%20Anti-Tracking)
+-  void GetVendor(nsString& s) const { s = nsString(); }
+-  void GetArchitecture(nsString& s) const { s = nsString(); }
+-  void GetDevice(nsString& s) const { s = nsString(); }
+-  void GetDescription(nsString& s) const { s = nsString(); }
++  void GetVendor(nsString&) const;
++  void GetArchitecture(nsString&) const;
++  void GetDevice(nsString&) const;
++  void GetDescription(nsString&) const;
+   uint32_t SubgroupMinSize() const;
+   uint32_t SubgroupMaxSize() const;
+   bool IsFallbackAdapter() const;
++  const camoufox::AdapterProfile* Profile() const;
+ 
+   // Non-standard field getters; see also TODO BUGZILLA LINK
+   void GetWgpuName(nsString&) const;
+@@ -95,6 +100,7 @@
+   RefPtr<SupportedLimits> mLimits;
+   RefPtr<AdapterInfo> mInfo;
+   const std::shared_ptr<ffi::WGPUAdapterInformation> mInfoInner;
++  std::shared_ptr<const camoufox::AdapterProfile> mProfile;
+ 
+  public:
+   Adapter(Instance* const aParent, WebGPUChild* const aChild,
+@@ -104,6 +110,8 @@
+   const RefPtr<AdapterInfo>& Info() const;
+   bool SupportSharedTextureInSwapChain() const;
+   uint64_t MissingFeatures() const;
++  bool ApplyProfile(std::shared_ptr<const camoufox::AdapterProfile> aProfile);
++  const camoufox::AdapterProfile* Profile() const { return mProfile.get(); }
+ 
+   nsCString LabelOrId() const {
+     nsCString ret = this->CLabel();
+diff --git a/dom/webgpu/Instance.cpp b/dom/webgpu/Instance.cpp
+--- a/dom/webgpu/Instance.cpp
++++ b/dom/webgpu/Instance.cpp
+@@ -3,6 +3,7 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "Instance.h"
++#include "MaskGraphics.hpp"
+ 
+ #include <optional>
+ #include <string_view>
+@@ -61,6 +62,15 @@
+ 
+ Instance::Instance(nsIGlobalObject* aGlobal)
+     : mGlobal(aGlobal), mWgslLanguageFeatures(new WGSLLanguageFeatures(this)) {
++  const auto& gpu = MaskConfig::GetGraphicsConfig().GPU();
++  if (gpu.contains("wgslLanguageFeatures")) {
++    IgnoredErrorResult rv;
++    for (const auto& value : gpu["wgslLanguageFeatures"]) {
++      const auto name = value.get<std::string>();
++      mWgslLanguageFeatures->Add(NS_ConvertUTF8toUTF16(name.c_str()), rv);
++    }
++    return;
++  }
+   // Populate `mWgslLanguageFeatures`.
+   IgnoredErrorResult rv;
+   nsCString wgslFeature;
+@@ -88,6 +98,17 @@
+   }
+ }
+ 
++dom::GPUTextureFormat Instance::GetPreferredCanvasFormat() const {
++  const auto& gpu = MaskConfig::GetGraphicsConfig().GPU();
++  if (gpu.contains("preferredCanvasFormat")) {
++    return gpu["preferredCanvasFormat"] == "rgba8unorm"
++               ? dom::GPUTextureFormat::Rgba8unorm
++               : dom::GPUTextureFormat::Bgra8unorm;
++  }
++  return kIsAndroid ? dom::GPUTextureFormat::Rgba8unorm
++                    : dom::GPUTextureFormat::Bgra8unorm;
++}
++
+ JSObject* Instance::WrapObject(JSContext* cx,
+                                JS::Handle<JSObject*> givenProto) {
+   return dom::GPU_Binding::Wrap(cx, this, givenProto);
+@@ -225,8 +246,19 @@
+   RawId adapter_id = ffi::wgpu_client_request_adapter(
+       child->GetClient(), power_preference, aOptions.mForceFallbackAdapter);
+ 
++  nlohmann::json request = {
++      {"featureLevel", NS_ConvertUTF16toUTF8(aOptions.mFeatureLevel).get()},
++      {"forceFallbackAdapter", aOptions.mForceFallbackAdapter},
++      {"xrCompatible", aOptions.mXrCompatible}};
++  if (aOptions.mPowerPreference.WasPassed()) {
++    request["powerPreference"] =
++        aOptions.mPowerPreference.Value() == dom::GPUPowerPreference::Low_power
++            ? "low-power" : "high-performance";
++  }
++  auto profile = std::make_shared<camoufox::AdapterProfile>(
++      MaskConfig::GetGraphicsConfig().SelectAdapter(request));
+   child->EnqueueRequestAdapterPromise(
+-      PendingRequestAdapterPromise{promise, this, adapter_id});
++      PendingRequestAdapterPromise{promise, this, adapter_id, std::move(profile)});
+ 
+   return promise.forget();
+ }
+diff --git a/dom/webgpu/Instance.h b/dom/webgpu/Instance.h
+--- a/dom/webgpu/Instance.h
++++ b/dom/webgpu/Instance.h
+@@ -65,15 +65,7 @@
+   already_AddRefed<dom::Promise> RequestAdapter(
+       const dom::GPURequestAdapterOptions& aOptions, ErrorResult& aRv);
+ 
+-  dom::GPUTextureFormat GetPreferredCanvasFormat() const {
+-    // Changing implementation in a way that increases fingerprinting surface?
+-    // Please create a bug in [Core::Privacy: Anti
+-    // Tracking](https://bugzilla.mozilla.org/enter_bug.cgi?product=Core&component=Privacy%3A%20Anti-Tracking)
+-    if (kIsAndroid) {
+-      return dom::GPUTextureFormat::Rgba8unorm;
+-    }
+-    return dom::GPUTextureFormat::Bgra8unorm;
+-  };
++  dom::GPUTextureFormat GetPreferredCanvasFormat() const;
+ 
+  private:
+   explicit Instance(nsIGlobalObject* aGlobal);
+diff --git a/dom/webgpu/ipc/WebGPUChild.cpp b/dom/webgpu/ipc/WebGPUChild.cpp
+--- a/dom/webgpu/ipc/WebGPUChild.cpp
++++ b/dom/webgpu/ipc/WebGPUChild.cpp
+@@ -106,6 +106,10 @@
+   } else {
+     auto info = std::make_shared<WGPUAdapterInformation>(*aAdapterInfo);
+     RefPtr<Adapter> adapter = new Adapter(pending_promise.instance, c, info);
++    if (!adapter->ApplyProfile(std::move(pending_promise.profile))) {
++      promise::MaybeResolveWithNull(std::move(pending_promise.promise));
++      return;
++    }
+     promise::MaybeResolve(std::move(pending_promise.promise),
+                           std::move(adapter));
+   }
+diff --git a/dom/webgpu/ipc/WebGPUChild.h b/dom/webgpu/ipc/WebGPUChild.h
+--- a/dom/webgpu/ipc/WebGPUChild.h
++++ b/dom/webgpu/ipc/WebGPUChild.h
+@@ -43,6 +43,7 @@
+   RefPtr<dom::Promise> promise;
+   RefPtr<Instance> instance;
+   RawId adapter_id;
++  std::shared_ptr<const camoufox::AdapterProfile> profile;
+ };
+ 
+ struct PendingRequestDevicePromise {
+diff --git a/dom/webgpu/ipc/WebGPUParent.cpp b/dom/webgpu/ipc/WebGPUParent.cpp
+--- a/dom/webgpu/ipc/WebGPUParent.cpp
++++ b/dom/webgpu/ipc/WebGPUParent.cpp
+@@ -3,6 +3,7 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "WebGPUParent.h"
++#include "MaskGraphics.hpp"
+ 
+ #include <unordered_set>
+ 
+@@ -304,14 +305,28 @@
+   parent->SwapChainDrop(owner, aTxnType, aTxnId);
+ }
+ 
++// Process-wide WGSL policy is consumed by the parser, not just API getters.
++extern uint32_t wgpu_parent_graphics_wgsl_mask() {
++  const auto& gpu = MaskConfig::GetGraphicsConfig().GPU();
++  if (!gpu.contains("wgslLanguageFeatures")) return UINT32_MAX;
++  uint32_t mask = 0;
++  for (const auto& feature : gpu["wgslLanguageFeatures"]) {
++    if (feature == "readonly_and_readwrite_storage_textures") mask |= 1;
++    if (feature == "packed_4x8_integer_dot_product") mask |= 2;
++    if (feature == "pointer_composite_access") mask |= 4;
++  }
++  return mask;
++}
++
+ #ifdef XP_WIN
+-extern void wgpu_parent_get_compositor_device_luid(
++extern bool wgpu_parent_get_compositor_device_luid(
+     struct WGPUFfiLUID* aOutLuid) {
+   auto luid = WebGPUParent::GetCompositorDeviceLuid();
+   if (luid.isSome()) {
+     *aOutLuid = luid.extract();
++    return true;
+   } else {
+-    aOutLuid = nullptr;
++    return false;
+   }
+ }
+ #endif
+diff --git a/dom/webgpu/moz.build b/dom/webgpu/moz.build
+--- a/dom/webgpu/moz.build
++++ b/dom/webgpu/moz.build
+@@ -16,6 +16,8 @@
+ REFTEST_MANIFESTS += ["tests/reftest/reftest.list"]
+ 
+ DIRS += []
++
++LOCAL_INCLUDES += ["/camoucfg"]
+ 
+ h_and_cpp = [
+     "Adapter",
+diff --git a/gfx/wgpu_bindings/src/server.rs b/gfx/wgpu_bindings/src/server.rs
+--- a/gfx/wgpu_bindings/src/server.rs
++++ b/gfx/wgpu_bindings/src/server.rs
+@@ -1683,7 +1683,8 @@
+         txn_id: crate::RemoteTextureTxnId,
+     );
+     #[cfg(target_os = "windows")]
+-    fn wgpu_parent_get_compositor_device_luid(out_luid: *mut crate::FfiLUID);
++    fn wgpu_parent_get_compositor_device_luid(out_luid: *mut crate::FfiLUID) -> bool;
++    fn wgpu_parent_graphics_wgsl_mask() -> u32;
+     fn wgpu_parent_post_request_device(parent: WebGPUParentPtr, device_id: id::DeviceId);
+     fn wgpu_parent_build_buffer_map_closure(
+         parent: WebGPUParentPtr,
+@@ -2383,7 +2384,18 @@
+                     label,
+                     runtime_checks: wgt::ShaderRuntimeChecks::checked(),
+                 };
+-                let source = wgc::pipeline::ShaderModuleSource::Wgsl(Cow::Borrowed(code.as_ref()));
++                let mask = unsafe { wgpu_parent_graphics_wgsl_mask() };
++                let source = if mask == u32::MAX {
++                    wgc::pipeline::ShaderModuleSource::Wgsl(Cow::Borrowed(code.as_ref()))
++                } else {
++                    use wgc::naga::front::wgsl::ImplementedLanguageExtension as Ext;
++                    let extensions = [(1, Ext::ReadOnlyAndReadWriteStorageTextures),
++                                      (2, Ext::Packed4x8IntegerDotProduct),
++                                      (4, Ext::PointerCompositeAccess)]
++                        .into_iter().filter_map(|(bit, ext)| (mask & bit != 0).then_some(ext)).collect();
++                    wgc::pipeline::ShaderModuleSource::WgslWithLanguageExtensions(
++                        Cow::Borrowed(code.as_ref()), extensions)
++                };
+                 let (_, error) =
+                     self.device_create_shader_module(device_id, &desc, source, Some(id));
+ 
+@@ -2814,11 +2826,13 @@
+             #[cfg(target_os = "windows")]
+             {
+                 let mut adapter_luid = core::mem::MaybeUninit::<crate::FfiLUID>::uninit();
+-                wgpu_parent_get_compositor_device_luid(adapter_luid.as_mut_ptr());
+-                let adapter_luid = if adapter_luid.as_ptr().is_null() {
++                let adapter_luid = if wgpu_parent_get_compositor_device_luid(adapter_luid.as_mut_ptr()) {
++                    Some(adapter_luid.assume_init())
++                } else {
++                    // No compositor adapter: preserve the failed ordinary
++                    // request without reading an uninitialized out parameter.
++                    if !force_fallback_adapter { result = Some(false); }
+                     None
+-                } else {
+-                    Some(adapter_luid.assume_init())
+                 };
+ 
+                 if adapter_luid.is_some() && !force_fallback_adapter {
+diff --git a/third_party/rust/naga/.cargo-checksum.json b/third_party/rust/naga/.cargo-checksum.json
+--- a/third_party/rust/naga/.cargo-checksum.json
++++ b/third_party/rust/naga/.cargo-checksum.json
+@@ -1 +1 @@
+-{"files":{".cargo/config.toml":"7248ed3bed246d755d7bf9e5d7842d74b5c270ba6c29ad907872b55a67707ee0","CHANGELOG.md":"e8b9446e0eedbce73856de88d7d055455678cc6fa4147d2ea37dbb4348c6509f","Cargo.toml":"23969f41b9b3f10a259589e0844f73f8367ce03c83ee0295cecd71eadacdb977","LICENSE.APACHE":"a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9","LICENSE.MIT":"dc0d97139e8205818c703741c7be7cb3b96888bd5917b8d6fc6133731e403c21","README.md":"777336887bd2e292c4e0117835e153f388976fbe05cd1d7388c1f101946b679a","build.rs":"b1aa8cfbdb081700515ff506517bba2720705db90c7c8e767100a95df998e705","src/arena/handle.rs":"a64b2ed8c97ea22eff20c431e930a303d67164c158cf5514535dc29601f4bc49","src/arena/handle_set.rs":"b8e00d3ab51337e82d59a38dc6bd7cef45337da24b9618147fcdd6ec8917617b","src/arena/handlevec.rs":"208d99644f9a6b6c1e88bbf9b280b01c62ce5bc8243727b31bafc3cc296d71c9","src/arena/mod.rs":"d16e93e946b174aff821110490d8fc291bd6fe95f23347319d8254267c4ea343","src/arena/range.rs":"0041168cee4c25d6b5bd4ba5cd42e138383f6a845e95ead3689bd3dd85c8b55c","src/arena/unique_arena.rs":"8fbe23c266d2d7e6f992e085124308ab6b300aeed92b2ea2cbeea62ea09c3aea","src/back/continue_forward.rs":"8194d238763caa6d5601ec3af56ba39a471c39945f43152b58d582092c99aefa","src/back/dot/mod.rs":"6786d7e5bb85973cff381d7d422e64921682e7d51b6c06a623076a653a5a068f","src/back/glsl/conv.rs":"ea8539900e571d2d05747102c3fbb13f175cba146955d66ba5c6605105c5a065","src/back/glsl/features.rs":"957a8afaac43be995d7ea971fbe786e9387101aa660df4162677bc5abfb24b01","src/back/glsl/keywords.rs":"fee8ed132e44bace54869a7c169a1ab7ed55db1bf590b4b1bce9efa4552e1dd7","src/back/glsl/mod.rs":"16f5c4fb45fda7594d9f193fea62d52c5595761ab8cfdc4a4d393a6815aac049","src/back/glsl/writer.rs":"6417c1bbb0da4dc3792383c9659a9cf5a4de97650111383dc6713d1b63b79c3e","src/back/hlsl/conv.rs":"002b3222bcebc6a467f68d00417c3cce4bbe155c7cab0f17565b6ce179716779","src/back/hlsl/help.rs":"77b5b7de9ed9d31fe7b31c65ebbc25b523c13744f10cf06470c7c60f1c2e498c","src/back/hlsl/keywords.rs":"35285ad56319ba8c8ba86064d71e7cdba82303ecfe4cfda97fb983a53c17a14b","src/back/hlsl/mesh_shader.rs":"956de5fdf194d33a9c67ff9c55082fac2143c23eb2fa3633b5eba9f3540ebf8d","src/back/hlsl/mod.rs":"9a2880cae24fdf2cffa60e09af5ee8325df39f3ee9c638284aff2697e2f08e8e","src/back/hlsl/ray.rs":"e3c9edc9b410af18ccf8bf717e4a33af20eefd15a404cdf460460236000dc8bd","src/back/hlsl/storage.rs":"5083d03b1f25fe767e45e0c507bd30424352fccd48484c081620712d3682aae8","src/back/hlsl/writer.rs":"7537239e9468711851a044835545f440e97cda8d6e4f8e2f3ce447d7d92066b7","src/back/mod.rs":"9c049f3d488a49d1cd6ca01c64df9df367cd54b328ac23abc998cacca1915dbd","src/back/msl/keywords.rs":"c0bf9d97ece12209782ae2c672c50210f7599cac0bdeb2f677b39a4fe4792e44","src/back/msl/mesh_shader.rs":"fbd6db78a16b536e66574873be7482c482bd561e479293449e1b7dfabf5c1ce6","src/back/msl/mod.rs":"91c5440ae1613cfb4bedfaadf9a51129446e202a1a0e789f0e2de6e8734ca301","src/back/msl/ray.rs":"11e9ab8b2eb42449440ad71ac187ccd5afec6e1f929e996555ef04192b712102","src/back/msl/sampler.rs":"173ffc391fae1b3008cea89d7bb2e183eeb182acd30a5bae80b1f0cf1af569f9","src/back/msl/writer.rs":"fdab93968e4a1d0f8dde934c66cc943e63fa851976bac5e3485e13e2430b363d","src/back/pipeline_constants.rs":"7ea68cee1d829afbb2c9ce9bad2548c7a4b85b28fb4f72d96f9e093f8c821c4f","src/back/spv/block.rs":"4073e8d2eb1f24bf8039ea591358f0e22b7cccfd5093c2b54c27c51ae603d069","src/back/spv/f16_polyfill.rs":"598be9f4de28d68e29050ca1ffe9037ea24770be0db0163ec80b03eb93df0765","src/back/spv/helpers.rs":"3660014a6a87a8c951495f5ccc20e522df0c09d3d2792131beb00d86d22aa76e","src/back/spv/image.rs":"6c5c9ff9007eee3a12f0ccf6248c2ad1b62e70cccb499f7723b94e38d2dc3d3e","src/back/spv/index.rs":"05b10dda48ffd08fb906304f3a184516d869ff973fcb8757faa13fb28dcec8f1","src/back/spv/instructions.rs":"c54b872cd40de69d42a50895c2ba23b54742d87b3b6909f3f82dffa1663e455a","src/back/spv/layout.rs":"3123ddc7d3887aece7b73550a5cf66306c6bc45ba79852bce8e0d0031a0a65f8","src/back/spv/mesh_shader.rs":"314e591230cbe1005fbbeeb4c3230026382d41592df5f0f61a3bbb4f7bdfd9b8","src/back/spv/mod.rs":"041b31a881a401051cfa2e83af60dccfc0e5cbf494ea4cb5f1b9e191ca98ebf1","src/back/spv/ray/mod.rs":"7aece2b675e78c7393e3908af5ebcf245bf9dc01ed0ab0902bedc4a9e5d229c2","src/back/spv/ray/pipeline.rs":"04d8a031ea510f6623246a0bf64a9342c8f4d7a1f50713a46ef891196167eb15","src/back/spv/ray/query.rs":"82be0a8fdb5cd508e798cbc2224a6b873fdf120cc743eb576c432c7c59899c87","src/back/spv/reclaimable.rs":"c6276d944b7d9a1b4002e29e6b5ee8dc72c64fec74b5c35416e8b0d8ee8c6a88","src/back/spv/selection.rs":"4d8b695a9796ca2cb701ef3c4a52d8c0099c55818487f5163edd3c58e1610156","src/back/spv/subgroup.rs":"68fc3e3153022a0a8bddec20ad9221820678f02921878318e571d5aa2ca13cee","src/back/spv/writer.rs":"9ff22a10b9026942370311b7a2d0fe16dcb249bcea979f0b168c93d71122c680","src/back/wgsl/mod.rs":"9df14a10f3b1aa53d6c9e0a636371efbbe0ac7465f010ed8587b0cdf6463e4b2","src/back/wgsl/polyfill/inverse/inverse_2x2_f16.wgsl":"9e7635d04724822931c805a8b35e76d6d294d447e4ea8d57b308ce45609bf736","src/back/wgsl/polyfill/inverse/inverse_2x2_f32.wgsl":"340d491abde07f93996391796db65a5f88402663eaf6b9d2d894d11cb8cf8b6d","src/back/wgsl/polyfill/inverse/inverse_3x3_f16.wgsl":"4f13a1a4b3e1b51f0f992d13c55cf854a80917554a4d13c997819fa1fe776ba4","src/back/wgsl/polyfill/inverse/inverse_3x3_f32.wgsl":"9b16d2f4b9e433c8e03a0cb46ab48508f3bf7e185ce1b4e26106c47e81a677cb","src/back/wgsl/polyfill/inverse/inverse_4x4_f16.wgsl":"86d39d1db5d03995b404950279db7f1698ad9622982aa319fdedb7532673235b","src/back/wgsl/polyfill/inverse/inverse_4x4_f32.wgsl":"dc510525ac2dce66389a8c4bf8b2f31f0dedd9e6debdbe4ffd939a0a7fc533d3","src/back/wgsl/polyfill/mod.rs":"f4ab3c9b9cdc36d16dab00d0f7f07d6e6beda0e27a36053e9b5ffeeb7ca18edc","src/back/wgsl/writer.rs":"e047e035f494eb5c7b6a9acb237fb6092d9218a90a427cd897772c032d82e246","src/common/diagnostic_debug.rs":"8c73fe605e5b6162d0485e264287ac50c061cf581743feebbffe1474d1d3516d","src/common/diagnostic_display.rs":"46f1ff8a32179703ef0bcdb704db9f6e6e8b4eaad6cadf94577eeab3d8a16cd1","src/common/mod.rs":"0c979fd43068cfbceb7b29ff0bc578327e0770d5403c12f48d8605f77efbe200","src/common/predeclared.rs":"a5f42d55f2e13d8f5a8213d4a881e9155c3994c4054d43edcf7bd7bb7c868ccf","src/common/wgsl/diagnostics.rs":"4fec985b4c5cc6dfae4dd78bd7c850adc88a1761d7b6691de0355ea49300e532","src/common/wgsl/mod.rs":"d944915ff692c96aecca67737bccc2d5d9eb68f475166a2744f29a025f4a4c93","src/common/wgsl/to_wgsl.rs":"fcb04860d33a77adce3d864cef11d6cf0ad9e3d72f0e0d4adced8fcac27c631b","src/common/wgsl/types.rs":"62da42d9d21f542b7aed9393303ba8c17feed49c4f82cb4a339fa0ac2bfacef0","src/compact/expressions.rs":"e2b4267ef76b75e452bc3b58c474b0a2960f0ffbec15788a79cc63eea14d73d6","src/compact/functions.rs":"b033cfe2212f1fd8170076a960c5793c2e62857603baa738ea5280e8880c0eac","src/compact/handle_set_map.rs":"b4688bff174487f2da4a1a946af07c80b6ba59f60dc84184c6a30039354209e8","src/compact/mod.rs":"e677096449031a12cb0e9381430e382c0bdbdb0cd1364e5785b03329a9f14e3b","src/compact/statements.rs":"9750a315fc926f71daa57cf56b5b2ab22785efa7921d1e69159c55bc1cef72f3","src/compact/types.rs":"32abe0e0e0d55044685c5c0d20d1688970217f106270f2bd4a35aa0444a5bdfe","src/diagnostic_filter.rs":"5e3d14a774974148b7d2918617ba3e2c3a07493e0f90485a7de9db86e05a7cd0","src/error.rs":"36b0cf4fde2b6cf616f8de5b3a444942843487f5e16f14cbb1e4b1d84e93bc59","src/front/atomic_upgrade.rs":"86ce9f9628d92a1a09802cb534bb4310236b83f2799c921b81c687f009c589be","src/front/glsl/ast.rs":"34fdd3d113b85d1f9cad8dc9ccdd944d1c5e88eae8f46b7088baa49e0307ef7b","src/front/glsl/builtins.rs":"ffe36464b5758dd8c917c3e9505d4027268e4b019174f0f95a229cd16d4cafa1","src/front/glsl/context.rs":"40db6d3cd1018aeb33a34e2e8e7380c33067de58f1011078d7fe80bb59bf0208","src/front/glsl/error.rs":"7ff2769319490f2cdaa3ebedda71148903d208f0171305ca24bed1caf2d6c62e","src/front/glsl/functions.rs":"6540d4f9ad9b569b3cfdd27084b497881ba1e861a5d5ebff9e39c5cb493f6bd7","src/front/glsl/lex.rs":"24706628b600b5ce435cef464c84196ac5d58013122a97e7b59d509cc25f85a2","src/front/glsl/mod.rs":"132f2a60812b3910f65e6281562d4dc94efa329fd1eb0f2778ffe67631a35f78","src/front/glsl/offset.rs":"66bd524a2d17dc44f431430dcbbb74a771fdab43c9581e88bb1123e6cfec516b","src/front/glsl/parser.rs":"95426e630b3ef8a9581f90c0e98af6e18bd419803baad02ebee0451c64d0f25d","src/front/glsl/parser/declarations.rs":"311212375f0ba39ef77889acadd54b9909cc9d043e424c0b6c9db3220d68d03e","src/front/glsl/parser/expressions.rs":"828f11ed3227de315d5d1b14f6f84ce098f77af9e31ff3ceb4e4906121d932fd","src/front/glsl/parser/functions.rs":"302e24e06190aff555131c33f9a80b15df6a0390d6c776f888a44d5ef7df697e","src/front/glsl/parser/types.rs":"ee242048a65cd3709e16b70a3882e9296e615327480f2ad779e3d2523778181f","src/front/glsl/parser_tests.rs":"6834f0d595f4077266054e5da43e4f1b60e5c6780611ab0f530d9964cc62fad3","src/front/glsl/token.rs":"83780c0c1954ef216896c9d8a48e412b357783e00ccd4909a7a249935c742629","src/front/glsl/types.rs":"286395d82707a09d28b4c1a8bade917822478e53d8eb277ceec5fa9e71649ba2","src/front/glsl/variables.rs":"cbef8fc6ba6619c6556629897409e23a01cff782772845fd29bd34f79f61a2e8","src/front/interpolator.rs":"60ffe9425d0db678804861e41223cf43a6d5b5fac9a257f7fcb44118ed4095b5","src/front/mod.rs":"3f42bb2e98b574c20d6f997a76fb614795e32e86f37d7e2c0ce53f8eb12b9cfd","src/front/spv/convert.rs":"14aeac182cb742eaf79c6ba49f3a577735d684550a33e749fb594b79591bb77c","src/front/spv/error.rs":"72397b185fe791ec126616b1cf40ab732cf5aeabf273f93e0703eb7a1de9b7de","src/front/spv/function.rs":"3c98c637fa3613a073bb8f4fc0a30c27153e8601c7f82a1c0730600020aca488","src/front/spv/image.rs":"c39ffdb19a19861cec009de39431a879be99bdd4d9d08c0ecdef397c2f3f6fa5","src/front/spv/mod.rs":"bf9716d69a84126950a567f0013c35ef0b3c2297605e3d94fe7d61e240f0d589","src/front/spv/next_block.rs":"4d8ab292fc9fc96105931ec1c907c44bd5828f2e3232dd60f8f42a5bdeb1497e","src/front/spv/null.rs":"ee20287365e025e8bcc91f29df930ff8b63cb6d7f26db0b1789d54de614a7353","src/front/type_gen.rs":"111832af89a268ae3206d2ba2159b9b9d64224ed09375a29eec142725ea7fb34","src/front/wgsl/error.rs":"c811a984cff50d7d84d22e07ae40f0b59e9f141390f53464a24b292736f62ac9","src/front/wgsl/index.rs":"476e5c4eddb14dfb53eee7976bcf4276c8a3fad81fbed92dc7b5dd31a5ab1593","src/front/wgsl/lower/construction.rs":"1685112c2cc40984a71574cbb17c022b298691f03a03472b198874500d24ecd9","src/front/wgsl/lower/conversion.rs":"98289fcf3f0f39a16ec1fb90bc32ac8babbf8476b83c1f7b06f5fd2b2c2c388c","src/front/wgsl/lower/mod.rs":"e46e5400797aa9cd10bc3f52420a34e6586cc29b82b86ffddc757dcbb57b20a0","src/front/wgsl/lower/template_list.rs":"62ca31b4f3240c16f70caa3e78801a556da740010186e5c1f3723e3ef6f6c815","src/front/wgsl/mod.rs":"c115e0154a68b762d162ef3529060f23659b13f95f8e2d326f043015ff3baf06","src/front/wgsl/parse/ast.rs":"0550ce8b91fbcdf382015c1a38faebd4e26d8cfa1bd352fe137044166190ebaf","src/front/wgsl/parse/conv.rs":"9dd08cd187abec8b68880a214991e513962cb367e2e3826ebc6f2e94db898570","src/front/wgsl/parse/directive.rs":"c96f33cef2c1d8a374fe1b3827538f7db33d6b7811a6e0914d29de80b8963257","src/front/wgsl/parse/directive/enable_extension.rs":"28ea23bfda2e066cc606cd29c39a87a812b18475630b50fb4f96ac11297cf22a","src/front/wgsl/parse/directive/language_extension.rs":"1ddfd0331ece96eddbb07a971991dd6285bd58e0276d94a5c26bf30eab0ac5be","src/front/wgsl/parse/lexer.rs":"ead44d83d84847d18e416b128c0e637c1aae83124dee24dcdc3aa995cd61fd47","src/front/wgsl/parse/mod.rs":"1120f6ccb1e7cbc6ce0d143b92e9cab4872222125e00a2f54c8722dd3bfda341","src/front/wgsl/parse/number.rs":"22de02e262fca0179fa3d2f6ea98b675ddaad37ca5a8bd1f4307595a3f135148","src/front/wgsl/tests.rs":"c0bc29cc8cc786a0b589da267b99a9b5e0c0871f8326d84d3b563025860f77bc","src/ir/block.rs":"85bac7b476b48240ebfe3660a2b3e781752faa895f71f7e52393e75e0bd8dbb7","src/ir/mod.rs":"795f88d98a07c8f38ed21ae1467a55f4368e397828d15b14c25f454754b61fc9","src/keywords/mod.rs":"47a6fde012bf7d1e70f0fac7762f6a8e7dca6b9bbb99e2cada773c61527cfbfe","src/keywords/wgsl.rs":"2448982b88efc945cad1fca249e111f9e8cee7fdca110e13913960b012cc94b4","src/lib.rs":"9d6216a8bd1d3dc644932ffab36694585d290464054026c41f2b10f3fdd800b7","src/non_max_u32.rs":"df5761bdb673a0939bde3081f1eb28258577d124792dd16d0376cee475fe2c02","src/proc/constant_evaluator.rs":"30e9d07de4acaa2d49150756e16eac0c6383f00dd741631b9609f746766bc909","src/proc/emitter.rs":"76e264b4c0877fe30bf20135685a289b76001188a78d5ca5b88edae5bb29646b","src/proc/index.rs":"a356017af35132873944f45183de968f3ccb605d9b953365488d2cb80ae0cfba","src/proc/keyword_set.rs":"928414d2b79ee48735d532e03d3f0a58427c3f27a2a0c6938425749b00943784","src/proc/layouter.rs":"fc30325208c0d2abf8a7c8374b76bad0eb5a842067e1014fc406a90ddaff5fc6","src/proc/mod.rs":"bb079c3d8d7afba31d67402535a839918e3a8e466f15330b5bb6a62416401b27","src/proc/namer.rs":"48f8dbc1d097d7517d1e140c7e013b2511c0efc55a07a527789a8d0e22fa9e11","src/proc/overloads/any_overload_set.rs":"877cd637d979abc08caa021dabb9821a79fc9109eb97024a230bcfac82830388","src/proc/overloads/constructor_set.rs":"b702f866ac1472bcc075bd0bede450388123b5899431934fd60a29865498c68b","src/proc/overloads/list.rs":"14e518ea086167feee3d3af5e60f1b7590e5554de4321a925d7702038b4bc3d4","src/proc/overloads/mathfunction.rs":"e52286eaaf7d0e18511a80b6d07e0ad62f26f6970e8ead7b1f6420faeed51957","src/proc/overloads/mod.rs":"0e96479cbd0ec9fa8200a5e88c16a22ee7ed2021ecf6f80a7e4ded69cad5239f","src/proc/overloads/one_bits_iter.rs":"6b98769fdec777d311248084f13958c5cca44659d0928603ece8618387ea58b2","src/proc/overloads/regular.rs":"73d64fab79019d589cb0595d0ef606fd6af732c42a418c60c81da4c96e113c89","src/proc/overloads/rule.rs":"b7f87d5ca0cffdaa8ee0db0110918f5a726359fd8a72bc638d8ce27a4b0ae3b2","src/proc/overloads/scalar_set.rs":"1e6dda4047c75b8101442e24bdbccab285b2c461273c870c25f531a641163146","src/proc/overloads/utils.rs":"d8f661579e917edb892b6a7e8babadbc0db1a110d74558b81b49b3331bd07a5e","src/proc/terminator.rs":"961edb1bbc2cfb0fe7da02e39103e57fd46e3b94a5c59276d31a195a2bffd551","src/proc/type_methods.rs":"aff77226382b1938b6aa9f538061140b4a4456331441c18ad263d9e8a774c28a","src/proc/typifier.rs":"2d9d1ec55b1c2d2f8f612cd3dbae8ff98e5d475b8292e3ddf60d3cf2966d0cab","src/racy_lock.rs":"c56313dcaf212301ddf9e665872f35868ce966002d175ae153c1f14c1b2c048a","src/span.rs":"d9442df7578e032eb7a1227911f24d215f7ca083bec2d6a4c9acfdb81e4b1c50","src/valid/analyzer.rs":"6debdb45287048b76569c9dc722da9db4181ebc96e1197cef9a833e547f356ea","src/valid/compose.rs":"46eeed8c4d5b66fc043ddb701074bd864a9fdd24e38b88e282046230acefb747","src/valid/expression.rs":"cd8159f9e171c46d0967202181ce42db4328fcb133f9867f10083e7e5e3bb734","src/valid/function.rs":"a05fa6329b69310777954db404217b6e82e8e75e966583fe8eacccb2647a5e7c","src/valid/handles.rs":"79eca0d668c2015657fb98887df827192abedd3681147586e96bf8c6f0f736cd","src/valid/immediates.rs":"42aace31a24de2615322119916dcffb7f46b78fda7e192c8ea4215aeecd73457","src/valid/interface.rs":"9ec98f7cc6d80a35e76d2847fa3733392639c7e54428afae0405ce7445e5f51c","src/valid/mod.rs":"eccdfdb0b549210467631359be59392584fa2a67777f7214a4db74f561fbc247","src/valid/type.rs":"a85b02b49fe3f38acad28910c61e994da3d9083f99b8e42b2bf90b9564c186c8"},"package":null}
+\ No newline at end of file
++{"files":{".cargo/config.toml":"7248ed3bed246d755d7bf9e5d7842d74b5c270ba6c29ad907872b55a67707ee0","CHANGELOG.md":"e8b9446e0eedbce73856de88d7d055455678cc6fa4147d2ea37dbb4348c6509f","Cargo.toml":"23969f41b9b3f10a259589e0844f73f8367ce03c83ee0295cecd71eadacdb977","LICENSE.APACHE":"a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9","LICENSE.MIT":"dc0d97139e8205818c703741c7be7cb3b96888bd5917b8d6fc6133731e403c21","README.md":"777336887bd2e292c4e0117835e153f388976fbe05cd1d7388c1f101946b679a","build.rs":"b1aa8cfbdb081700515ff506517bba2720705db90c7c8e767100a95df998e705","src/arena/handle.rs":"a64b2ed8c97ea22eff20c431e930a303d67164c158cf5514535dc29601f4bc49","src/arena/handle_set.rs":"b8e00d3ab51337e82d59a38dc6bd7cef45337da24b9618147fcdd6ec8917617b","src/arena/handlevec.rs":"208d99644f9a6b6c1e88bbf9b280b01c62ce5bc8243727b31bafc3cc296d71c9","src/arena/mod.rs":"d16e93e946b174aff821110490d8fc291bd6fe95f23347319d8254267c4ea343","src/arena/range.rs":"0041168cee4c25d6b5bd4ba5cd42e138383f6a845e95ead3689bd3dd85c8b55c","src/arena/unique_arena.rs":"8fbe23c266d2d7e6f992e085124308ab6b300aeed92b2ea2cbeea62ea09c3aea","src/back/continue_forward.rs":"8194d238763caa6d5601ec3af56ba39a471c39945f43152b58d582092c99aefa","src/back/dot/mod.rs":"6786d7e5bb85973cff381d7d422e64921682e7d51b6c06a623076a653a5a068f","src/back/glsl/conv.rs":"ea8539900e571d2d05747102c3fbb13f175cba146955d66ba5c6605105c5a065","src/back/glsl/features.rs":"957a8afaac43be995d7ea971fbe786e9387101aa660df4162677bc5abfb24b01","src/back/glsl/keywords.rs":"fee8ed132e44bace54869a7c169a1ab7ed55db1bf590b4b1bce9efa4552e1dd7","src/back/glsl/mod.rs":"16f5c4fb45fda7594d9f193fea62d52c5595761ab8cfdc4a4d393a6815aac049","src/back/glsl/writer.rs":"6417c1bbb0da4dc3792383c9659a9cf5a4de97650111383dc6713d1b63b79c3e","src/back/hlsl/conv.rs":"002b3222bcebc6a467f68d00417c3cce4bbe155c7cab0f17565b6ce179716779","src/back/hlsl/help.rs":"77b5b7de9ed9d31fe7b31c65ebbc25b523c13744f10cf06470c7c60f1c2e498c","src/back/hlsl/keywords.rs":"35285ad56319ba8c8ba86064d71e7cdba82303ecfe4cfda97fb983a53c17a14b","src/back/hlsl/mesh_shader.rs":"956de5fdf194d33a9c67ff9c55082fac2143c23eb2fa3633b5eba9f3540ebf8d","src/back/hlsl/mod.rs":"9a2880cae24fdf2cffa60e09af5ee8325df39f3ee9c638284aff2697e2f08e8e","src/back/hlsl/ray.rs":"e3c9edc9b410af18ccf8bf717e4a33af20eefd15a404cdf460460236000dc8bd","src/back/hlsl/storage.rs":"5083d03b1f25fe767e45e0c507bd30424352fccd48484c081620712d3682aae8","src/back/hlsl/writer.rs":"7537239e9468711851a044835545f440e97cda8d6e4f8e2f3ce447d7d92066b7","src/back/mod.rs":"9c049f3d488a49d1cd6ca01c64df9df367cd54b328ac23abc998cacca1915dbd","src/back/msl/keywords.rs":"c0bf9d97ece12209782ae2c672c50210f7599cac0bdeb2f677b39a4fe4792e44","src/back/msl/mesh_shader.rs":"fbd6db78a16b536e66574873be7482c482bd561e479293449e1b7dfabf5c1ce6","src/back/msl/mod.rs":"91c5440ae1613cfb4bedfaadf9a51129446e202a1a0e789f0e2de6e8734ca301","src/back/msl/ray.rs":"11e9ab8b2eb42449440ad71ac187ccd5afec6e1f929e996555ef04192b712102","src/back/msl/sampler.rs":"173ffc391fae1b3008cea89d7bb2e183eeb182acd30a5bae80b1f0cf1af569f9","src/back/msl/writer.rs":"fdab93968e4a1d0f8dde934c66cc943e63fa851976bac5e3485e13e2430b363d","src/back/pipeline_constants.rs":"7ea68cee1d829afbb2c9ce9bad2548c7a4b85b28fb4f72d96f9e093f8c821c4f","src/back/spv/block.rs":"4073e8d2eb1f24bf8039ea591358f0e22b7cccfd5093c2b54c27c51ae603d069","src/back/spv/f16_polyfill.rs":"598be9f4de28d68e29050ca1ffe9037ea24770be0db0163ec80b03eb93df0765","src/back/spv/helpers.rs":"3660014a6a87a8c951495f5ccc20e522df0c09d3d2792131beb00d86d22aa76e","src/back/spv/image.rs":"6c5c9ff9007eee3a12f0ccf6248c2ad1b62e70cccb499f7723b94e38d2dc3d3e","src/back/spv/index.rs":"05b10dda48ffd08fb906304f3a184516d869ff973fcb8757faa13fb28dcec8f1","src/back/spv/instructions.rs":"c54b872cd40de69d42a50895c2ba23b54742d87b3b6909f3f82dffa1663e455a","src/back/spv/layout.rs":"3123ddc7d3887aece7b73550a5cf66306c6bc45ba79852bce8e0d0031a0a65f8","src/back/spv/mesh_shader.rs":"314e591230cbe1005fbbeeb4c3230026382d41592df5f0f61a3bbb4f7bdfd9b8","src/back/spv/mod.rs":"041b31a881a401051cfa2e83af60dccfc0e5cbf494ea4cb5f1b9e191ca98ebf1","src/back/spv/ray/mod.rs":"7aece2b675e78c7393e3908af5ebcf245bf9dc01ed0ab0902bedc4a9e5d229c2","src/back/spv/ray/pipeline.rs":"04d8a031ea510f6623246a0bf64a9342c8f4d7a1f50713a46ef891196167eb15","src/back/spv/ray/query.rs":"82be0a8fdb5cd508e798cbc2224a6b873fdf120cc743eb576c432c7c59899c87","src/back/spv/reclaimable.rs":"c6276d944b7d9a1b4002e29e6b5ee8dc72c64fec74b5c35416e8b0d8ee8c6a88","src/back/spv/selection.rs":"4d8b695a9796ca2cb701ef3c4a52d8c0099c55818487f5163edd3c58e1610156","src/back/spv/subgroup.rs":"68fc3e3153022a0a8bddec20ad9221820678f02921878318e571d5aa2ca13cee","src/back/spv/writer.rs":"9ff22a10b9026942370311b7a2d0fe16dcb249bcea979f0b168c93d71122c680","src/back/wgsl/mod.rs":"9df14a10f3b1aa53d6c9e0a636371efbbe0ac7465f010ed8587b0cdf6463e4b2","src/back/wgsl/polyfill/inverse/inverse_2x2_f16.wgsl":"9e7635d04724822931c805a8b35e76d6d294d447e4ea8d57b308ce45609bf736","src/back/wgsl/polyfill/inverse/inverse_2x2_f32.wgsl":"340d491abde07f93996391796db65a5f88402663eaf6b9d2d894d11cb8cf8b6d","src/back/wgsl/polyfill/inverse/inverse_3x3_f16.wgsl":"4f13a1a4b3e1b51f0f992d13c55cf854a80917554a4d13c997819fa1fe776ba4","src/back/wgsl/polyfill/inverse/inverse_3x3_f32.wgsl":"9b16d2f4b9e433c8e03a0cb46ab48508f3bf7e185ce1b4e26106c47e81a677cb","src/back/wgsl/polyfill/inverse/inverse_4x4_f16.wgsl":"86d39d1db5d03995b404950279db7f1698ad9622982aa319fdedb7532673235b","src/back/wgsl/polyfill/inverse/inverse_4x4_f32.wgsl":"dc510525ac2dce66389a8c4bf8b2f31f0dedd9e6debdbe4ffd939a0a7fc533d3","src/back/wgsl/polyfill/mod.rs":"f4ab3c9b9cdc36d16dab00d0f7f07d6e6beda0e27a36053e9b5ffeeb7ca18edc","src/back/wgsl/writer.rs":"e047e035f494eb5c7b6a9acb237fb6092d9218a90a427cd897772c032d82e246","src/common/diagnostic_debug.rs":"8c73fe605e5b6162d0485e264287ac50c061cf581743feebbffe1474d1d3516d","src/common/diagnostic_display.rs":"46f1ff8a32179703ef0bcdb704db9f6e6e8b4eaad6cadf94577eeab3d8a16cd1","src/common/mod.rs":"0c979fd43068cfbceb7b29ff0bc578327e0770d5403c12f48d8605f77efbe200","src/common/predeclared.rs":"a5f42d55f2e13d8f5a8213d4a881e9155c3994c4054d43edcf7bd7bb7c868ccf","src/common/wgsl/diagnostics.rs":"4fec985b4c5cc6dfae4dd78bd7c850adc88a1761d7b6691de0355ea49300e532","src/common/wgsl/mod.rs":"d944915ff692c96aecca67737bccc2d5d9eb68f475166a2744f29a025f4a4c93","src/common/wgsl/to_wgsl.rs":"fcb04860d33a77adce3d864cef11d6cf0ad9e3d72f0e0d4adced8fcac27c631b","src/common/wgsl/types.rs":"62da42d9d21f542b7aed9393303ba8c17feed49c4f82cb4a339fa0ac2bfacef0","src/compact/expressions.rs":"e2b4267ef76b75e452bc3b58c474b0a2960f0ffbec15788a79cc63eea14d73d6","src/compact/functions.rs":"b033cfe2212f1fd8170076a960c5793c2e62857603baa738ea5280e8880c0eac","src/compact/handle_set_map.rs":"b4688bff174487f2da4a1a946af07c80b6ba59f60dc84184c6a30039354209e8","src/compact/mod.rs":"e677096449031a12cb0e9381430e382c0bdbdb0cd1364e5785b03329a9f14e3b","src/compact/statements.rs":"9750a315fc926f71daa57cf56b5b2ab22785efa7921d1e69159c55bc1cef72f3","src/compact/types.rs":"32abe0e0e0d55044685c5c0d20d1688970217f106270f2bd4a35aa0444a5bdfe","src/diagnostic_filter.rs":"5e3d14a774974148b7d2918617ba3e2c3a07493e0f90485a7de9db86e05a7cd0","src/error.rs":"36b0cf4fde2b6cf616f8de5b3a444942843487f5e16f14cbb1e4b1d84e93bc59","src/front/atomic_upgrade.rs":"86ce9f9628d92a1a09802cb534bb4310236b83f2799c921b81c687f009c589be","src/front/glsl/ast.rs":"34fdd3d113b85d1f9cad8dc9ccdd944d1c5e88eae8f46b7088baa49e0307ef7b","src/front/glsl/builtins.rs":"ffe36464b5758dd8c917c3e9505d4027268e4b019174f0f95a229cd16d4cafa1","src/front/glsl/context.rs":"40db6d3cd1018aeb33a34e2e8e7380c33067de58f1011078d7fe80bb59bf0208","src/front/glsl/error.rs":"7ff2769319490f2cdaa3ebedda71148903d208f0171305ca24bed1caf2d6c62e","src/front/glsl/functions.rs":"6540d4f9ad9b569b3cfdd27084b497881ba1e861a5d5ebff9e39c5cb493f6bd7","src/front/glsl/lex.rs":"24706628b600b5ce435cef464c84196ac5d58013122a97e7b59d509cc25f85a2","src/front/glsl/mod.rs":"132f2a60812b3910f65e6281562d4dc94efa329fd1eb0f2778ffe67631a35f78","src/front/glsl/offset.rs":"66bd524a2d17dc44f431430dcbbb74a771fdab43c9581e88bb1123e6cfec516b","src/front/glsl/parser.rs":"95426e630b3ef8a9581f90c0e98af6e18bd419803baad02ebee0451c64d0f25d","src/front/glsl/parser/declarations.rs":"311212375f0ba39ef77889acadd54b9909cc9d043e424c0b6c9db3220d68d03e","src/front/glsl/parser/expressions.rs":"828f11ed3227de315d5d1b14f6f84ce098f77af9e31ff3ceb4e4906121d932fd","src/front/glsl/parser/functions.rs":"302e24e06190aff555131c33f9a80b15df6a0390d6c776f888a44d5ef7df697e","src/front/glsl/parser/types.rs":"ee242048a65cd3709e16b70a3882e9296e615327480f2ad779e3d2523778181f","src/front/glsl/parser_tests.rs":"6834f0d595f4077266054e5da43e4f1b60e5c6780611ab0f530d9964cc62fad3","src/front/glsl/token.rs":"83780c0c1954ef216896c9d8a48e412b357783e00ccd4909a7a249935c742629","src/front/glsl/types.rs":"286395d82707a09d28b4c1a8bade917822478e53d8eb277ceec5fa9e71649ba2","src/front/glsl/variables.rs":"cbef8fc6ba6619c6556629897409e23a01cff782772845fd29bd34f79f61a2e8","src/front/interpolator.rs":"60ffe9425d0db678804861e41223cf43a6d5b5fac9a257f7fcb44118ed4095b5","src/front/mod.rs":"3f42bb2e98b574c20d6f997a76fb614795e32e86f37d7e2c0ce53f8eb12b9cfd","src/front/spv/convert.rs":"14aeac182cb742eaf79c6ba49f3a577735d684550a33e749fb594b79591bb77c","src/front/spv/error.rs":"72397b185fe791ec126616b1cf40ab732cf5aeabf273f93e0703eb7a1de9b7de","src/front/spv/function.rs":"3c98c637fa3613a073bb8f4fc0a30c27153e8601c7f82a1c0730600020aca488","src/front/spv/image.rs":"c39ffdb19a19861cec009de39431a879be99bdd4d9d08c0ecdef397c2f3f6fa5","src/front/spv/mod.rs":"bf9716d69a84126950a567f0013c35ef0b3c2297605e3d94fe7d61e240f0d589","src/front/spv/next_block.rs":"4d8ab292fc9fc96105931ec1c907c44bd5828f2e3232dd60f8f42a5bdeb1497e","src/front/spv/null.rs":"ee20287365e025e8bcc91f29df930ff8b63cb6d7f26db0b1789d54de614a7353","src/front/type_gen.rs":"111832af89a268ae3206d2ba2159b9b9d64224ed09375a29eec142725ea7fb34","src/front/wgsl/error.rs":"003321449e26ce2bc44acef96f1c724b4cb48636db72dcfa5334f145474ab709","src/front/wgsl/index.rs":"476e5c4eddb14dfb53eee7976bcf4276c8a3fad81fbed92dc7b5dd31a5ab1593","src/front/wgsl/lower/construction.rs":"1685112c2cc40984a71574cbb17c022b298691f03a03472b198874500d24ecd9","src/front/wgsl/lower/conversion.rs":"98289fcf3f0f39a16ec1fb90bc32ac8babbf8476b83c1f7b06f5fd2b2c2c388c","src/front/wgsl/lower/mod.rs":"a9576ca17ceb73cd9a613164084499cf327a6cb028f70152793adba8aaefe4a5","src/front/wgsl/lower/template_list.rs":"62ca31b4f3240c16f70caa3e78801a556da740010186e5c1f3723e3ef6f6c815","src/front/wgsl/mod.rs":"d06dd2f2ce613180534b8e0fa92664bb553f182ba4e9f98eec36b09a3057f738","src/front/wgsl/parse/ast.rs":"0550ce8b91fbcdf382015c1a38faebd4e26d8cfa1bd352fe137044166190ebaf","src/front/wgsl/parse/conv.rs":"9dd08cd187abec8b68880a214991e513962cb367e2e3826ebc6f2e94db898570","src/front/wgsl/parse/directive.rs":"c96f33cef2c1d8a374fe1b3827538f7db33d6b7811a6e0914d29de80b8963257","src/front/wgsl/parse/directive/enable_extension.rs":"28ea23bfda2e066cc606cd29c39a87a812b18475630b50fb4f96ac11297cf22a","src/front/wgsl/parse/directive/language_extension.rs":"1ddfd0331ece96eddbb07a971991dd6285bd58e0276d94a5c26bf30eab0ac5be","src/front/wgsl/parse/lexer.rs":"ead44d83d84847d18e416b128c0e637c1aae83124dee24dcdc3aa995cd61fd47","src/front/wgsl/parse/mod.rs":"fb35b7381a216f40a925098f146881b788dec4e1e0381c172e2369bdf92772ae","src/front/wgsl/parse/number.rs":"22de02e262fca0179fa3d2f6ea98b675ddaad37ca5a8bd1f4307595a3f135148","src/front/wgsl/tests.rs":"c0bc29cc8cc786a0b589da267b99a9b5e0c0871f8326d84d3b563025860f77bc","src/ir/block.rs":"85bac7b476b48240ebfe3660a2b3e781752faa895f71f7e52393e75e0bd8dbb7","src/ir/mod.rs":"795f88d98a07c8f38ed21ae1467a55f4368e397828d15b14c25f454754b61fc9","src/keywords/mod.rs":"47a6fde012bf7d1e70f0fac7762f6a8e7dca6b9bbb99e2cada773c61527cfbfe","src/keywords/wgsl.rs":"2448982b88efc945cad1fca249e111f9e8cee7fdca110e13913960b012cc94b4","src/lib.rs":"9d6216a8bd1d3dc644932ffab36694585d290464054026c41f2b10f3fdd800b7","src/non_max_u32.rs":"df5761bdb673a0939bde3081f1eb28258577d124792dd16d0376cee475fe2c02","src/proc/constant_evaluator.rs":"30e9d07de4acaa2d49150756e16eac0c6383f00dd741631b9609f746766bc909","src/proc/emitter.rs":"76e264b4c0877fe30bf20135685a289b76001188a78d5ca5b88edae5bb29646b","src/proc/index.rs":"a356017af35132873944f45183de968f3ccb605d9b953365488d2cb80ae0cfba","src/proc/keyword_set.rs":"928414d2b79ee48735d532e03d3f0a58427c3f27a2a0c6938425749b00943784","src/proc/layouter.rs":"fc30325208c0d2abf8a7c8374b76bad0eb5a842067e1014fc406a90ddaff5fc6","src/proc/mod.rs":"bb079c3d8d7afba31d67402535a839918e3a8e466f15330b5bb6a62416401b27","src/proc/namer.rs":"48f8dbc1d097d7517d1e140c7e013b2511c0efc55a07a527789a8d0e22fa9e11","src/proc/overloads/any_overload_set.rs":"877cd637d979abc08caa021dabb9821a79fc9109eb97024a230bcfac82830388","src/proc/overloads/constructor_set.rs":"b702f866ac1472bcc075bd0bede450388123b5899431934fd60a29865498c68b","src/proc/overloads/list.rs":"14e518ea086167feee3d3af5e60f1b7590e5554de4321a925d7702038b4bc3d4","src/proc/overloads/mathfunction.rs":"e52286eaaf7d0e18511a80b6d07e0ad62f26f6970e8ead7b1f6420faeed51957","src/proc/overloads/mod.rs":"0e96479cbd0ec9fa8200a5e88c16a22ee7ed2021ecf6f80a7e4ded69cad5239f","src/proc/overloads/one_bits_iter.rs":"6b98769fdec777d311248084f13958c5cca44659d0928603ece8618387ea58b2","src/proc/overloads/regular.rs":"73d64fab79019d589cb0595d0ef606fd6af732c42a418c60c81da4c96e113c89","src/proc/overloads/rule.rs":"b7f87d5ca0cffdaa8ee0db0110918f5a726359fd8a72bc638d8ce27a4b0ae3b2","src/proc/overloads/scalar_set.rs":"1e6dda4047c75b8101442e24bdbccab285b2c461273c870c25f531a641163146","src/proc/overloads/utils.rs":"d8f661579e917edb892b6a7e8babadbc0db1a110d74558b81b49b3331bd07a5e","src/proc/terminator.rs":"961edb1bbc2cfb0fe7da02e39103e57fd46e3b94a5c59276d31a195a2bffd551","src/proc/type_methods.rs":"aff77226382b1938b6aa9f538061140b4a4456331441c18ad263d9e8a774c28a","src/proc/typifier.rs":"2d9d1ec55b1c2d2f8f612cd3dbae8ff98e5d475b8292e3ddf60d3cf2966d0cab","src/racy_lock.rs":"c56313dcaf212301ddf9e665872f35868ce966002d175ae153c1f14c1b2c048a","src/span.rs":"d9442df7578e032eb7a1227911f24d215f7ca083bec2d6a4c9acfdb81e4b1c50","src/valid/analyzer.rs":"6debdb45287048b76569c9dc722da9db4181ebc96e1197cef9a833e547f356ea","src/valid/compose.rs":"46eeed8c4d5b66fc043ddb701074bd864a9fdd24e38b88e282046230acefb747","src/valid/expression.rs":"cd8159f9e171c46d0967202181ce42db4328fcb133f9867f10083e7e5e3bb734","src/valid/function.rs":"a05fa6329b69310777954db404217b6e82e8e75e966583fe8eacccb2647a5e7c","src/valid/handles.rs":"79eca0d668c2015657fb98887df827192abedd3681147586e96bf8c6f0f736cd","src/valid/immediates.rs":"42aace31a24de2615322119916dcffb7f46b78fda7e192c8ea4215aeecd73457","src/valid/interface.rs":"9ec98f7cc6d80a35e76d2847fa3733392639c7e54428afae0405ce7445e5f51c","src/valid/mod.rs":"eccdfdb0b549210467631359be59392584fa2a67777f7214a4db74f561fbc247","src/valid/type.rs":"a85b02b49fe3f38acad28910c61e994da3d9083f99b8e42b2bf90b9564c186c8"},"package":null}
+diff --git a/third_party/rust/naga/src/front/wgsl/error.rs b/third_party/rust/naga/src/front/wgsl/error.rs
+--- a/third_party/rust/naga/src/front/wgsl/error.rs
++++ b/third_party/rust/naga/src/front/wgsl/error.rs
+@@ -217,6 +217,7 @@
+     UnknownConservativeDepth(Span),
+     UnknownEnableExtension(Span, &'a str),
+     UnknownLanguageExtension(Span, &'a str),
++    LanguageExtensionNotEnabled(Span, &'static str),
+     UnknownDiagnosticRuleName(Span),
+     SizeAttributeTooLow(Span, u32),
+     SizeAttributeRequiresFixedFootprint(Span),
+@@ -743,6 +744,11 @@
+                 )
+                 .into()],
+             },
++            Error::LanguageExtensionNotEnabled(span, name) => ParseError {
++                message: format!("language extension '{name}' is not enabled"),
++                labels: vec![(span, "not in the exposed WGSL feature set".into())],
++                notes: vec![],
++            },
+             Error::UnknownDiagnosticRuleName(span) => ParseError {
+                 message: format!("unknown `diagnostic(…)` rule name `{}`", &source[span]),
+                 labels: vec![(span, "not a valid diagnostic rule name".into())],
+diff --git a/third_party/rust/naga/src/front/wgsl/lower/mod.rs b/third_party/rust/naga/src/front/wgsl/lower/mod.rs
+--- a/third_party/rust/naga/src/front/wgsl/lower/mod.rs
++++ b/third_party/rust/naga/src/front/wgsl/lower/mod.rs
+@@ -1263,11 +1263,31 @@
+ 
+ pub struct Lowerer<'source, 'temp> {
+     index: &'temp Index<'source>,
++    allowed_language_extensions: Option<&'temp [super::ImplementedLanguageExtension]>,
+ }
+ 
+ impl<'source, 'temp> Lowerer<'source, 'temp> {
+     pub const fn new(index: &'temp Index<'source>) -> Self {
+-        Self { index }
++        Self { index, allowed_language_extensions: None }
++    }
++
++    pub fn with_language_extensions(
++        mut self,
++        allowed: Option<&'temp [super::ImplementedLanguageExtension]>,
++    ) -> Self {
++        self.allowed_language_extensions = allowed;
++        self
++    }
++
++    fn require_language_extension(
++        &self,
++        extension: super::ImplementedLanguageExtension,
++        span: Span,
++    ) -> Result<'source, ()> {
++        if self.allowed_language_extensions.is_some_and(|allowed| !allowed.contains(&extension)) {
++            return Err(Box::new(Error::LanguageExtensionNotEnabled(span, extension.to_ident())));
++        }
++        Ok(())
+     }
+ 
+     pub fn lower(&mut self, tu: ast::TranslationUnit<'source>) -> Result<'source, ir::Module> {
+@@ -2466,6 +2486,8 @@
+                 // Declare pointer as reference
+                 if let Typed::Plain(handle) = lowered_base {
+                     if resolve_inner!(ctx, handle).pointer_space().is_some() {
++                        self.require_language_extension(
++                            super::ImplementedLanguageExtension::PointerCompositeAccess, span)?;
+                         lowered_base = Typed::Reference(handle);
+                     }
+                 }
+@@ -2490,6 +2512,8 @@
+                 // Declare pointer as reference
+                 if let Typed::Plain(handle) = lowered_base {
+                     if resolve_inner!(ctx, handle).pointer_space().is_some() {
++                        self.require_language_extension(
++                            super::ImplementedLanguageExtension::PointerCompositeAccess, span)?;
+                         lowered_base = Typed::Reference(handle);
+                     }
+                 }
+@@ -2859,6 +2883,11 @@
+                     conv::TypeGenerator::StorageTexture { dim, arrayed } => {
+                         let format = tl.storage_format(ctx)?;
+                         let access = tl.access_mode(ctx)?;
++                        if access.contains(ir::StorageAccess::LOAD) {
++                            self.require_language_extension(
++                                super::ImplementedLanguageExtension::ReadOnlyAndReadWriteStorageTextures,
++                                Span::UNDEFINED)?;
++                        }
+                         ir::TypeInner::Image {
+                             dim,
+                             arrayed,
+@@ -4023,6 +4052,13 @@
+         ast_arguments: &[Handle<ast::Expression<'source>>],
+         ctx: &mut ExpressionContext<'source, '_, '_>,
+     ) -> Result<'source, ir::Expression> {
++        if matches!(fun, ir::MathFunction::Dot4I8Packed | ir::MathFunction::Dot4U8Packed
++            | ir::MathFunction::Pack4xI8 | ir::MathFunction::Pack4xU8
++            | ir::MathFunction::Pack4xI8Clamp | ir::MathFunction::Pack4xU8Clamp
++            | ir::MathFunction::Unpack4xI8 | ir::MathFunction::Unpack4xU8) {
++            self.require_language_extension(
++                super::ImplementedLanguageExtension::Packed4x8IntegerDotProduct, span)?;
++        }
+         let mut lowered_arguments = Vec::with_capacity(ast_arguments.len());
+         for &arg in ast_arguments {
+             let lowered = self.expression_for_abstract(arg, ctx)?;
+diff --git a/third_party/rust/naga/src/front/wgsl/mod.rs b/third_party/rust/naga/src/front/wgsl/mod.rs
+--- a/third_party/rust/naga/src/front/wgsl/mod.rs
++++ b/third_party/rust/naga/src/front/wgsl/mod.rs
+@@ -54,7 +54,7 @@
+         }
+     }
+ 
+-    pub const fn set_options(&mut self, options: Options) {
++    pub fn set_options(&mut self, options: Options) {
+         self.options = options;
+     }
+ 
+@@ -65,7 +65,9 @@
+     fn inner<'a>(&mut self, source: &'a str) -> Result<'a, crate::Module> {
+         let tu = self.parser.parse(source, &self.options)?;
+         let index = index::Index::generate(&tu)?;
+-        let module = Lowerer::new(&index).lower(tu)?;
++        let module = Lowerer::new(&index)
++            .with_language_extensions(self.options.allowed_language_extensions.as_deref())
++            .lower(tu)?;
+ 
+         Ok(module)
+     }
+diff --git a/third_party/rust/naga/src/front/wgsl/parse/mod.rs b/third_party/rust/naga/src/front/wgsl/parse/mod.rs
+--- a/third_party/rust/naga/src/front/wgsl/parse/mod.rs
++++ b/third_party/rust/naga/src/front/wgsl/parse/mod.rs
+@@ -7,7 +7,9 @@
+ };
+ use crate::front::wgsl::error::{DiagnosticAttributeNotSupportedPosition, Error, ExpectedToken};
+ use crate::front::wgsl::parse::directive::enable_extension::{EnableExtension, EnableExtensions};
+-use crate::front::wgsl::parse::directive::language_extension::LanguageExtension;
++use crate::front::wgsl::parse::directive::language_extension::{
++    ImplementedLanguageExtension, LanguageExtension,
++};
+ use crate::front::wgsl::parse::directive::DirectiveKind;
+ use crate::front::wgsl::parse::lexer::{Lexer, Token, TokenSpan};
+ use crate::front::wgsl::parse::number::Number;
+@@ -284,6 +286,8 @@
+     pub parse_doc_comments: bool,
+     /// Capabilities to enable during parsing.
+     pub capabilities: crate::valid::Capabilities,
++    /// Optional embedding policy for the language extensions exposed to users.
++    pub allowed_language_extensions: Option<Vec<ImplementedLanguageExtension>>,
+ }
+ 
+ impl Options {
+@@ -292,6 +296,7 @@
+         Options {
+             parse_doc_comments: false,
+             capabilities: crate::valid::Capabilities::all(),
++            allowed_language_extensions: None,
+         }
+     }
+ }
+@@ -2292,7 +2297,11 @@
+                     DirectiveKind::Requires => {
+                         self.directive_ident_list(&mut lexer, |ident, span| {
+                             match LanguageExtension::from_ident(ident) {
+-                                Some(LanguageExtension::Implemented(_kind)) => {
++                                Some(LanguageExtension::Implemented(kind)) => {
++                                    if options.allowed_language_extensions.as_ref()
++                                        .is_some_and(|allowed| !allowed.contains(&kind)) {
++                                        return Err(Box::new(Error::LanguageExtensionNotEnabled(span, kind.to_ident())));
++                                    }
+                                     // NOTE: No further validation is needed for an extension, so
+                                     // just throw parsed information away. If we ever want to apply
+                                     // what we've parsed to diagnostics, maybe we'll want to refer
+diff --git a/third_party/rust/wgpu-core/.cargo-checksum.json b/third_party/rust/wgpu-core/.cargo-checksum.json
+--- a/third_party/rust/wgpu-core/.cargo-checksum.json
++++ b/third_party/rust/wgpu-core/.cargo-checksum.json
+@@ -1 +1 @@
+-{"files":{"Cargo.toml":"8ea13d94aabc467825b4ba1b16a3ddedef6c913000483d97c5b0ce59c92dbca7","LICENSE.APACHE":"a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9","LICENSE.MIT":"dc0d97139e8205818c703741c7be7cb3b96888bd5917b8d6fc6133731e403c21","build.rs":"f3d39c06752630257f6bf5efe76a61e54b32b354704f7c16c76c8e2128fa6b34","src/as_hal.rs":"5d08d8e49b016abb662957d8e42ab748d580a2f3e449caeeb7311f222b8818f6","src/binding_model.rs":"1b0cd12aad8c582ca2d6a7c9a8c53b7863ab02a709d109e6560767d575ba4827","src/command/allocator.rs":"386cb6e60bd332a881dbbe57ff66a0fa83f35e3ee924559f1689418ac6c7273a","src/command/bind.rs":"188d8507f2399db23c5614151a0c3489fd9edd73ca94d4a539a4fd36d823e832","src/command/bundle.rs":"cfa90cd6919b1cff5b77c8c6b5963cd9ccde2d85b82fe30b780c772ad2a6bd81","src/command/clear.rs":"76a032c93c0c297610aa1064f90de9279b81d5ad9478bf5da884c97a5ec3c1f7","src/command/compute.rs":"f43fcb6ae9355c90548789e4b02c95556cc7f9d4620b091792d2f5d4c1cc6c98","src/command/compute_command.rs":"7cb0b83584f40606966d272d22981a94a5ede5ca50778a25dd6481ee3ef39978","src/command/draw.rs":"2ad390cbc668bb38a653ad156c3fc81e34115f6fc240b2a4b8fb3ad6ba260abc","src/command/encoder.rs":"7655f8c248120f39e37f3ad0f84bd9816df78a75657790ab12d5aba144fef65f","src/command/encoder_command.rs":"2f9417c9c6c0cb52db561ed7d8a777fc29b59ade95a98ffaf91e4bb84f3b8cda","src/command/ffi.rs":"4924adbb42a670b5e9827c0f2175939981e8fc78a36b2fe370426e8c550a4ce7","src/command/memory_init.rs":"f68a796c4262d261620cf85e5762e267dee013f4ef5d61f67fcb173b59048983","src/command/mod.rs":"1270c9d1150ef5c5fc85f2f6efb6e0a3e8d5fc436820e1393f62bda8baf3832e","src/command/pass.rs":"23e387b37be1d85e5924b5288d3eac201a248e52546341427f50c5f060c2f9df","src/command/query.rs":"753bdd238bd88ca4f8ea5dff2f0796ab923b8cb0ba81c36a327fc5ca95116818","src/command/ray_tracing.rs":"106f7c9d8eebe34b312469dce0b557882cb868cbe5977fb6804312d6075cf5fc","src/command/render.rs":"fb974926b16588f8814725a421374d27d90288f5035b068a5ef32bebb39803f8","src/command/render_command.rs":"99c1e1b143a015e55bdb2076e35c1be8db58df79ed2b80c05fd070d1a830bb6b","src/command/timestamp_writes.rs":"da06fb07b8d0917be3e7fb9212d0ffc6b16526e1c1df617213ef354c3e1fb446","src/command/transfer.rs":"46659ab834a883c87450ec3d71accf1c8664a37abb332b251d421fae96f6c6e8","src/command/transition_resources.rs":"98f4eea41552b4b3a6adad43bba7d27d06506042de2ed995abfe8c5b59456dbb","src/conv.rs":"6142ee1793ad9b59dd3b95c87f15539a17333e0780c5dd5bdff92475711f1b36","src/device/bgl.rs":"b081fe1393f1dd917151efc3a10ee0269fecd3920eac3b45411c1197a98c5a06","src/device/global.rs":"efba12e70d7283affb70e5467d3cb7ba555f04b838cdbf1e87a1fbd72248a66d","src/device/life.rs":"913b3974b2c246dc855cc14a1800ba4c657e6e0a71186283c873f4b7c559b23a","src/device/mod.rs":"198137efcaa1da9fc7822d8dba69da4d200f58e47ad16715883a62781ca5b2e5","src/device/queue.rs":"50914a8db9b3d1a8c3888bb963a5bedb0aadf9a310c60a89cf2d1b3e0b3534f8","src/device/ray_tracing.rs":"31292bfee695b7ac5254025c02c6db885f20469f50cd7e09b9f62dd892fef486","src/device/resource.rs":"0b50ca852fa60f0387561a193b4a458184801d3d822aa925ac2d047483be1971","src/device/trace.rs":"364edffdac8e501074b24adb300b9e536c72e19d3d3c8c02a6af7e96ba5649a3","src/device/trace/record.rs":"7359d432f3776829e78ab6e88fc70cb439d054eaf21184c1a7ed02cc761dab0b","src/device/trace/replay.rs":"24cd8e175810071114855793a1219de0ed01c33daa7d1329195a64df5f11c626","src/error.rs":"4f07a0b09b30b2d6cbc855d0091d724000f492018af3b41e80befbeccf2a6f4e","src/global.rs":"b29b96777103398ed337ceae8d866c4606c5cdc5ace2db6555bacf66766306af","src/hash_utils.rs":"9f57a627fe3f00659391670141df62f68d67922c7b186f2a9a5958ab16fb576f","src/hub.rs":"563ef01e7bfbdb2ed5f37f0f3d0925f88d8398849651e97e8ae7922ab5b3bf39","src/id.rs":"f739aadcc8fd0d66cf22fd47d7ccbe51fc396384b2e3402f866ec5af11b1f737","src/identity.rs":"712ccda267eb602655c53672a94346aa4c9f88c0044ae6edcd658a814c9a50cf","src/indirect_validation/dispatch.rs":"feb39fceceb2748286642d9e7177b5844474e2645f6be3a9b801dd889388fb76","src/indirect_validation/draw.rs":"344fc0c28bbc3d4047600735657255f39ca1797631ed541b0912857830f5ddcb","src/indirect_validation/mod.rs":"ce5da877666eb5c932a99d543d259892f0817dba2b52d35ec7ac463ace03bd63","src/indirect_validation/utils.rs":"a7fc3c2d81b6f4ce3facbc9b007012c5bd8d5e89d78b41bb8ba154e08cb94cb8","src/indirect_validation/validate_draw.wgsl":"35a34174ac4a61b9684283878eb42468c1843b6778114bff3ef4dc40976e05d7","src/init_tracker/buffer.rs":"6167a400ab271ba857f1c507e60a46fbd318c185aff87eecf7eb05f7f09b6963","src/init_tracker/mod.rs":"38773a6e51c165d8e54f1ab56f2a0c20c3a126ac3cb19733ea8b423fc305e214","src/init_tracker/texture.rs":"ffdc67d4be23bcd48b22945de94ac0ea8ee571f91eb6d00323b9afe6fa91eef3","src/instance.rs":"bf254719050e206e3b7dd0c2442b03d0428d78183de6c11b1cfcf9a8b4a101e1","src/lib.rs":"7fae320751d99bad9572d7f77e83b6abc5608b04cdb756f7680edacf762f98a4","src/limits.rs":"8048ddfe56b4237640598274a8e73c8fdd2a869f9270cbbd3670ed47a0d62e37","src/lock/mod.rs":"8d3ae3f8d004d7f7d8a3aefe9f30b35669cb8e2409f5fba27b1fcb116b2429c4","src/lock/observing.rs":"723d57ff30b2abba64e65baf7523f58eecd794408d25e455923c2b293a6689ed","src/lock/rank.rs":"624a5da459c344217c22335b83fb6a2649d108c2c1d33bbe488c2b9b45499128","src/lock/ranked.rs":"af0e3dc4c96bec06992c6ebdbbf49f59bebb828e05f5577555250ac93fd48925","src/lock/vanilla.rs":"ca8156d4c981473d437db1056487a44c714760d685819eaff8cf82fb0098a608","src/pipeline.rs":"881a1499ad3aae6c370a192896a9042fff39ab6913cf8ffd42b8089802b77875","src/pipeline_cache.rs":"405eb93e70aea178d5fb8b80744d683c42204a4244e527a09a09ee9705c07d99","src/pool.rs":"e11bfdc73a66321d26715465fa74657dcd26a9b856b80b8369b4aac2132a4295","src/present.rs":"a72f9a2058375b148594376e28d4558ff0fbb40834ddcb2b2a334b820dd873af","src/ray_tracing.rs":"da0f5c4bfdf1718c26c51014c8ad6be86678bc8ad4b86fbd62243ed26596f6f7","src/registry.rs":"2a76c6397998d263b6f6347299f04a8d27ea4df7dda200e98f205cfa3850dadb","src/resource.rs":"b46382f0e961fe199e0bcd47b5bdac9b5c09aab7df1a0787d86d3e4bb94912ca","src/scratch.rs":"ea5c40e4d18a12f09cc1038f2dcdddb69b13e99275ac987d826658229a39b326","src/snatch.rs":"bf422810afd952894e365cd397763d42d6365ce3c5a5b4c1170566432f462939","src/storage.rs":"1a5bbf125a1cf65a36d8580e426ef1847c1638003fea0c6f76e309f5923b7692","src/timestamp_normalization/common.wgsl":"9f65aef0526ff9dde945fae70cef064ad961b0aee4291759ae82974cd2ead0a7","src/timestamp_normalization/mod.rs":"64f00f6aedd84ed53d45fe895d0f498d8df28df904cb2430ab118329c0535c5b","src/timestamp_normalization/timestamp_normalization.wgsl":"c0225bf02fdd741542bd20664a6d9195b91936e6f7758c9c4c0ac05b08122e79","src/track/blas.rs":"18c7b5b89a60ab49bbc0f4f8b85a24502c1d968714ef4c586095e119848d902a","src/track/buffer.rs":"b5c1ba69545186d1771ce7062d6c2f097f6a66dcec0453df4ccf7e1098a17d12","src/track/metadata.rs":"b3140163ef3ac1682ed11183d16a19562f11ffe081d9aa7b128bff1ec4db2fdb","src/track/mod.rs":"369ac69f5a008c9640356667ed33e380a41a12284026a4cc5593d07e6286f19f","src/track/range.rs":"2688b05a0c6e8510ff6ba3a9623e8b83f433a05ba743129928c56c93d9a9c233","src/track/stateless.rs":"3db699f5f48a319fa07fb16cdf51e1623d6ecac7a476467ee366e014ea665b89","src/track/texture.rs":"3dbf098ef4e9516fd678ec94492096b6a8232f5276f46f275c09d0bb2da0c1ca","src/validation.rs":"14e1471049d500d4fa1831c4bb0b5f8e7e68bf644a36751c15f54e0b90e56c02","src/validation/shader_io_deductions.rs":"b690145ca7286a7f356b9df68ce49421a30bdc242e38e1c07a6568d23587410d","src/weak_vec.rs":"a4193add5912b91226a3155cc613365b7fafdf2e7929d21d68bc19d149696e85"},"package":null}
+\ No newline at end of file
++{"files":{"Cargo.toml":"8ea13d94aabc467825b4ba1b16a3ddedef6c913000483d97c5b0ce59c92dbca7","LICENSE.APACHE":"a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9","LICENSE.MIT":"dc0d97139e8205818c703741c7be7cb3b96888bd5917b8d6fc6133731e403c21","build.rs":"f3d39c06752630257f6bf5efe76a61e54b32b354704f7c16c76c8e2128fa6b34","src/as_hal.rs":"5d08d8e49b016abb662957d8e42ab748d580a2f3e449caeeb7311f222b8818f6","src/binding_model.rs":"1b0cd12aad8c582ca2d6a7c9a8c53b7863ab02a709d109e6560767d575ba4827","src/command/allocator.rs":"386cb6e60bd332a881dbbe57ff66a0fa83f35e3ee924559f1689418ac6c7273a","src/command/bind.rs":"188d8507f2399db23c5614151a0c3489fd9edd73ca94d4a539a4fd36d823e832","src/command/bundle.rs":"cfa90cd6919b1cff5b77c8c6b5963cd9ccde2d85b82fe30b780c772ad2a6bd81","src/command/clear.rs":"76a032c93c0c297610aa1064f90de9279b81d5ad9478bf5da884c97a5ec3c1f7","src/command/compute.rs":"f43fcb6ae9355c90548789e4b02c95556cc7f9d4620b091792d2f5d4c1cc6c98","src/command/compute_command.rs":"7cb0b83584f40606966d272d22981a94a5ede5ca50778a25dd6481ee3ef39978","src/command/draw.rs":"2ad390cbc668bb38a653ad156c3fc81e34115f6fc240b2a4b8fb3ad6ba260abc","src/command/encoder.rs":"7655f8c248120f39e37f3ad0f84bd9816df78a75657790ab12d5aba144fef65f","src/command/encoder_command.rs":"2f9417c9c6c0cb52db561ed7d8a777fc29b59ade95a98ffaf91e4bb84f3b8cda","src/command/ffi.rs":"4924adbb42a670b5e9827c0f2175939981e8fc78a36b2fe370426e8c550a4ce7","src/command/memory_init.rs":"f68a796c4262d261620cf85e5762e267dee013f4ef5d61f67fcb173b59048983","src/command/mod.rs":"1270c9d1150ef5c5fc85f2f6efb6e0a3e8d5fc436820e1393f62bda8baf3832e","src/command/pass.rs":"23e387b37be1d85e5924b5288d3eac201a248e52546341427f50c5f060c2f9df","src/command/query.rs":"753bdd238bd88ca4f8ea5dff2f0796ab923b8cb0ba81c36a327fc5ca95116818","src/command/ray_tracing.rs":"106f7c9d8eebe34b312469dce0b557882cb868cbe5977fb6804312d6075cf5fc","src/command/render.rs":"fb974926b16588f8814725a421374d27d90288f5035b068a5ef32bebb39803f8","src/command/render_command.rs":"99c1e1b143a015e55bdb2076e35c1be8db58df79ed2b80c05fd070d1a830bb6b","src/command/timestamp_writes.rs":"da06fb07b8d0917be3e7fb9212d0ffc6b16526e1c1df617213ef354c3e1fb446","src/command/transfer.rs":"46659ab834a883c87450ec3d71accf1c8664a37abb332b251d421fae96f6c6e8","src/command/transition_resources.rs":"98f4eea41552b4b3a6adad43bba7d27d06506042de2ed995abfe8c5b59456dbb","src/conv.rs":"6142ee1793ad9b59dd3b95c87f15539a17333e0780c5dd5bdff92475711f1b36","src/device/bgl.rs":"b081fe1393f1dd917151efc3a10ee0269fecd3920eac3b45411c1197a98c5a06","src/device/global.rs":"843070de63686068b1bdf17eacae1b92362e247a15663375677db57044c2803c","src/device/life.rs":"913b3974b2c246dc855cc14a1800ba4c657e6e0a71186283c873f4b7c559b23a","src/device/mod.rs":"198137efcaa1da9fc7822d8dba69da4d200f58e47ad16715883a62781ca5b2e5","src/device/queue.rs":"50914a8db9b3d1a8c3888bb963a5bedb0aadf9a310c60a89cf2d1b3e0b3534f8","src/device/ray_tracing.rs":"31292bfee695b7ac5254025c02c6db885f20469f50cd7e09b9f62dd892fef486","src/device/resource.rs":"af27c2393eef2b4bc3a06c6ce73367d63cbc4ba70e424c1cf32284034d633863","src/device/trace.rs":"364edffdac8e501074b24adb300b9e536c72e19d3d3c8c02a6af7e96ba5649a3","src/device/trace/record.rs":"7359d432f3776829e78ab6e88fc70cb439d054eaf21184c1a7ed02cc761dab0b","src/device/trace/replay.rs":"24cd8e175810071114855793a1219de0ed01c33daa7d1329195a64df5f11c626","src/error.rs":"4f07a0b09b30b2d6cbc855d0091d724000f492018af3b41e80befbeccf2a6f4e","src/global.rs":"b29b96777103398ed337ceae8d866c4606c5cdc5ace2db6555bacf66766306af","src/hash_utils.rs":"9f57a627fe3f00659391670141df62f68d67922c7b186f2a9a5958ab16fb576f","src/hub.rs":"563ef01e7bfbdb2ed5f37f0f3d0925f88d8398849651e97e8ae7922ab5b3bf39","src/id.rs":"f739aadcc8fd0d66cf22fd47d7ccbe51fc396384b2e3402f866ec5af11b1f737","src/identity.rs":"712ccda267eb602655c53672a94346aa4c9f88c0044ae6edcd658a814c9a50cf","src/indirect_validation/dispatch.rs":"feb39fceceb2748286642d9e7177b5844474e2645f6be3a9b801dd889388fb76","src/indirect_validation/draw.rs":"344fc0c28bbc3d4047600735657255f39ca1797631ed541b0912857830f5ddcb","src/indirect_validation/mod.rs":"ce5da877666eb5c932a99d543d259892f0817dba2b52d35ec7ac463ace03bd63","src/indirect_validation/utils.rs":"a7fc3c2d81b6f4ce3facbc9b007012c5bd8d5e89d78b41bb8ba154e08cb94cb8","src/indirect_validation/validate_draw.wgsl":"35a34174ac4a61b9684283878eb42468c1843b6778114bff3ef4dc40976e05d7","src/init_tracker/buffer.rs":"6167a400ab271ba857f1c507e60a46fbd318c185aff87eecf7eb05f7f09b6963","src/init_tracker/mod.rs":"38773a6e51c165d8e54f1ab56f2a0c20c3a126ac3cb19733ea8b423fc305e214","src/init_tracker/texture.rs":"ffdc67d4be23bcd48b22945de94ac0ea8ee571f91eb6d00323b9afe6fa91eef3","src/instance.rs":"bf254719050e206e3b7dd0c2442b03d0428d78183de6c11b1cfcf9a8b4a101e1","src/lib.rs":"7fae320751d99bad9572d7f77e83b6abc5608b04cdb756f7680edacf762f98a4","src/limits.rs":"8048ddfe56b4237640598274a8e73c8fdd2a869f9270cbbd3670ed47a0d62e37","src/lock/mod.rs":"8d3ae3f8d004d7f7d8a3aefe9f30b35669cb8e2409f5fba27b1fcb116b2429c4","src/lock/observing.rs":"723d57ff30b2abba64e65baf7523f58eecd794408d25e455923c2b293a6689ed","src/lock/rank.rs":"624a5da459c344217c22335b83fb6a2649d108c2c1d33bbe488c2b9b45499128","src/lock/ranked.rs":"af0e3dc4c96bec06992c6ebdbbf49f59bebb828e05f5577555250ac93fd48925","src/lock/vanilla.rs":"ca8156d4c981473d437db1056487a44c714760d685819eaff8cf82fb0098a608","src/pipeline.rs":"32a0d2318f19fba7d890dd4454d94c4596d94d4f492e17d8052d781f7f88b0ad","src/pipeline_cache.rs":"405eb93e70aea178d5fb8b80744d683c42204a4244e527a09a09ee9705c07d99","src/pool.rs":"e11bfdc73a66321d26715465fa74657dcd26a9b856b80b8369b4aac2132a4295","src/present.rs":"a72f9a2058375b148594376e28d4558ff0fbb40834ddcb2b2a334b820dd873af","src/ray_tracing.rs":"da0f5c4bfdf1718c26c51014c8ad6be86678bc8ad4b86fbd62243ed26596f6f7","src/registry.rs":"2a76c6397998d263b6f6347299f04a8d27ea4df7dda200e98f205cfa3850dadb","src/resource.rs":"b46382f0e961fe199e0bcd47b5bdac9b5c09aab7df1a0787d86d3e4bb94912ca","src/scratch.rs":"ea5c40e4d18a12f09cc1038f2dcdddb69b13e99275ac987d826658229a39b326","src/snatch.rs":"bf422810afd952894e365cd397763d42d6365ce3c5a5b4c1170566432f462939","src/storage.rs":"1a5bbf125a1cf65a36d8580e426ef1847c1638003fea0c6f76e309f5923b7692","src/timestamp_normalization/common.wgsl":"9f65aef0526ff9dde945fae70cef064ad961b0aee4291759ae82974cd2ead0a7","src/timestamp_normalization/mod.rs":"64f00f6aedd84ed53d45fe895d0f498d8df28df904cb2430ab118329c0535c5b","src/timestamp_normalization/timestamp_normalization.wgsl":"c0225bf02fdd741542bd20664a6d9195b91936e6f7758c9c4c0ac05b08122e79","src/track/blas.rs":"18c7b5b89a60ab49bbc0f4f8b85a24502c1d968714ef4c586095e119848d902a","src/track/buffer.rs":"b5c1ba69545186d1771ce7062d6c2f097f6a66dcec0453df4ccf7e1098a17d12","src/track/metadata.rs":"b3140163ef3ac1682ed11183d16a19562f11ffe081d9aa7b128bff1ec4db2fdb","src/track/mod.rs":"369ac69f5a008c9640356667ed33e380a41a12284026a4cc5593d07e6286f19f","src/track/range.rs":"2688b05a0c6e8510ff6ba3a9623e8b83f433a05ba743129928c56c93d9a9c233","src/track/stateless.rs":"3db699f5f48a319fa07fb16cdf51e1623d6ecac7a476467ee366e014ea665b89","src/track/texture.rs":"3dbf098ef4e9516fd678ec94492096b6a8232f5276f46f275c09d0bb2da0c1ca","src/validation.rs":"14e1471049d500d4fa1831c4bb0b5f8e7e68bf644a36751c15f54e0b90e56c02","src/validation/shader_io_deductions.rs":"b690145ca7286a7f356b9df68ce49421a30bdc242e38e1c07a6568d23587410d","src/weak_vec.rs":"a4193add5912b91226a3155cc613365b7fafdf2e7929d21d68bc19d149696e85"},"package":null}
+diff --git a/third_party/rust/wgpu-core/src/device/global.rs b/third_party/rust/wgpu-core/src/device/global.rs
+--- a/third_party/rust/wgpu-core/src/device/global.rs
++++ b/third_party/rust/wgpu-core/src/device/global.rs
+@@ -1013,7 +1013,8 @@
+ 
+                 match source {
+                     #[cfg(feature = "wgsl")]
+-                    pipeline::ShaderModuleSource::Wgsl(ref code) => {
++                    pipeline::ShaderModuleSource::Wgsl(ref code)
++                    | pipeline::ShaderModuleSource::WgslWithLanguageExtensions(ref code, _) => {
+                         trace.make_binary(DataKind::Wgsl, code.as_bytes())
+                     }
+                     #[cfg(feature = "glsl")]
+diff --git a/third_party/rust/wgpu-core/src/device/resource.rs b/third_party/rust/wgpu-core/src/device/resource.rs
+--- a/third_party/rust/wgpu-core/src/device/resource.rs
++++ b/third_party/rust/wgpu-core/src/device/resource.rs
+@@ -2283,14 +2283,21 @@
+     ) -> Result<Arc<pipeline::ShaderModule>, pipeline::CreateShaderModuleError> {
+         self.check_is_valid()?;
+ 
++        #[cfg(feature = "wgsl")]
++        let allowed_language_extensions = match &source {
++            pipeline::ShaderModuleSource::WgslWithLanguageExtensions(_, allowed) => Some(allowed.clone()),
++            _ => None,
++        };
+         let (module, source) = match source {
+             #[cfg(feature = "wgsl")]
+-            pipeline::ShaderModuleSource::Wgsl(code) => {
++            pipeline::ShaderModuleSource::Wgsl(code)
++            | pipeline::ShaderModuleSource::WgslWithLanguageExtensions(code, _) => {
+                 profiling::scope!("naga::front::wgsl::parse");
+                 let capabilities =
+                     features_to_naga_capabilities(self.features, self.downlevel.flags);
+                 let mut options = naga::front::wgsl::Options::new();
+                 options.capabilities = capabilities;
++                options.allowed_language_extensions = allowed_language_extensions;
+                 let mut frontend = naga::front::wgsl::Frontend::new_with_options(options);
+                 let module = frontend.parse(&code).map_err(|inner| {
+                     pipeline::CreateShaderModuleError::Parsing(naga::error::ShaderError {
+diff --git a/third_party/rust/wgpu-core/src/pipeline.rs b/third_party/rust/wgpu-core/src/pipeline.rs
+--- a/third_party/rust/wgpu-core/src/pipeline.rs
++++ b/third_party/rust/wgpu-core/src/pipeline.rs
+@@ -40,6 +40,8 @@
+ pub enum ShaderModuleSource<'a> {
+     #[cfg(feature = "wgsl")]
+     Wgsl(Cow<'a, str>),
++    #[cfg(feature = "wgsl")]
++    WgslWithLanguageExtensions(Cow<'a, str>, Vec<naga::front::wgsl::ImplementedLanguageExtension>),
+     #[cfg(feature = "glsl")]
+     Glsl(Cow<'a, str>, naga::front::glsl::Options),
+     #[cfg(feature = "spirv")]
+diff --git a/toolkit/components/enterprisepolicies/EnterprisePoliciesParent.sys.mjs b/toolkit/components/enterprisepolicies/EnterprisePoliciesParent.sys.mjs
+--- a/toolkit/components/enterprisepolicies/EnterprisePoliciesParent.sys.mjs
++++ b/toolkit/components/enterprisepolicies/EnterprisePoliciesParent.sys.mjs
+@@ -664,6 +664,19 @@
+         lazy.log.debug(`policies.json content = ${data}`);
+         this._policies = JSON.parse(data).policies;
+ 
++        // This option releases only Camoufox's bundled acceleration policy.
++        // System, registry, alternate-file and other policies stay unchanged.
++        if (
++          this._policies?.HardwareAcceleration === false &&
++          ChromeUtils.camouGetBool("gfx:hardwareAcceleration", false)
++        ) {
++          const bundledFile = Services.dirsvc.get("XREAppDist", Ci.nsIFile);
++          bundledFile.append(POLICIES_FILENAME);
++          if (configFile.equals(bundledFile)) {
++            delete this._policies.HardwareAcceleration;
++          }
++        }
++
+         if (!this._policies) {
+           lazy.log.error("Policies file doesn't contain a 'policies' object");
+           this._policies = null;
+diff --git a/toolkit/xre/moz.build b/toolkit/xre/moz.build
+--- a/toolkit/xre/moz.build
++++ b/toolkit/xre/moz.build
+@@ -177,6 +177,8 @@
+ ]
+ 
+ include("/ipc/chromium/chromium-config.mozbuild")
++
++LOCAL_INCLUDES += ["/camoucfg"]
+ 
+ FINAL_LIBRARY = "xul"
+ 
+diff --git a/toolkit/xre/nsAppRunner.cpp b/toolkit/xre/nsAppRunner.cpp
+--- a/toolkit/xre/nsAppRunner.cpp
++++ b/toolkit/xre/nsAppRunner.cpp
+@@ -21,6 +21,7 @@
+ #include "mozilla/Likely.h"
+ #include "mozilla/Logging.h"
+ #include "mozilla/Preferences.h"
++#include "MaskGraphics.hpp"
+ #include "mozilla/PreferenceSheet.h"
+ #include "mozilla/Printf.h"
+ #include "mozilla/ProcessType.h"
+@@ -5536,6 +5537,8 @@
+   nsresult rv = NS_OK;
+   NS_ASSERTION(mScopedXPCOM, "Scoped xpcom not initialized.");
+ 
++  const auto& graphicsConfig = MaskConfig::GetGraphicsConfig();
++
+ #if defined(XP_WIN)
+   RefPtr<mozilla::DllServices> dllServices(mozilla::DllServices::Get());
+   dllServices->StartUntrustedModulesProcessor(false);
+@@ -5739,6 +5742,15 @@
+     // files can't override JS engine start-up prefs.
+     mDirProvider.FinishInitializingUserPrefs();
+ 
++    // A process-local default/lock leaves the profile's user values intact.
++    // Apply before app-startup initializes graphics and WebIDL exposure.
++    // Administrative policies still get their normal later startup phase.
++    if (!Preferences::IsLocked("dom.webgpu.enabled")) {
++      Preferences::SetBool("dom.webgpu.enabled", graphicsConfig.WebGPUEnabled(),
++                           PrefValueKind::Default);
++      Preferences::Lock("dom.webgpu.enabled");
++    }
++
+     // Now that the profiler, directory services, and prefs have been
+     // initialized we can find the download directory, where the profiler can
+     // write profiles when user stops the profiler using POSIX signal handling.
+@@ -6063,6 +6075,16 @@
+  *            .app/Contents/Resources.
+  */
+ int XREMain::XRE_main(int argc, char* argv[], const BootstrapConfig& aConfig) {
++  // Reject invalid launch data before initializing XPCOM/profile services;
++  // returning from XRE_mainRun that early cannot perform normal teardown.
++  const auto& graphicsConfig = MaskConfig::GetGraphicsConfig();
++  if (!graphicsConfig.Errors().empty()) {
++    for (const auto& error : graphicsConfig.Errors()) {
++      fprintf(stderr, "ERROR: Camoufox graphics configuration: %s\n",
++              error.c_str());
++    }
++    return 1;
++  }
+   gArgc = argc;
+   gArgv = argv;
+   AppRunnerTelemFlags appRunnerTelemFlags{};

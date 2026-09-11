@@ -103,8 +103,16 @@ def add_includes_to_package(package_file, includes, fonts, new_file, target):
             elif os.path.exists(os.path.join(target_dir, path)):
                 os.remove(os.path.join(target_dir, path))
 
-        # Update package
-        run(join(['7z', 'u', new_file, f'{temp_dir}/*', '-r', '-mx=9']))
+        # Build a fresh archive: reproducible builds can have identical file
+        # sizes/timestamps but different bytes. Updating an existing archive
+        # with `7z u` would silently keep stale binaries in that case.
+        destination = os.path.abspath(new_file)
+        with tempfile.TemporaryDirectory(
+            prefix='.camoufox-package-', dir=os.path.dirname(destination)
+        ) as archive_dir:
+            staged_archive = os.path.join(archive_dir, os.path.basename(new_file))
+            run(join(['7z', 'a', staged_archive, f'{temp_dir}/*', '-r', '-mx=9']))
+            os.replace(staged_archive, destination)
 
 
 def get_args():

@@ -8,8 +8,11 @@ with Files("**"):
     BUG_COMPONENT = ("Core", "DOM: UI Events & Focus Handling")
 
 EXPORTS += [
+    "GraphicsConfig.hpp",
     "MaskConfig.hpp",
+    "MaskGraphics.hpp",
     "MouseTrajectories.hpp",
+    "WindowResolution.hpp",
 ]
 
 LOCAL_INCLUDES += [

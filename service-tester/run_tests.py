@@ -33,7 +33,7 @@ if sys.platform == "win32":
 from pathlib import Path
 from typing import Optional
 
-from _bundle import ensure_bundle, start_http_server
+from _bundle import collect_results, ensure_bundle, start_http_server
 from _certificate import (
     compute_cross_profile,
     generate_certificate,
@@ -148,7 +148,7 @@ async def run_tests(
                 # Wait for all tests to complete
                 print(f"  Waiting for all tests to complete...")
                 await asyncio.gather(
-                    *[p.wait_for_function("!!window.__testComplete__", timeout=120_000)
+                    *[p.wait_for_selector("#__camoufoxResults__", state="attached", timeout=120_000)
                       for p in pages],
                     return_exceptions=True,
                 )
@@ -159,12 +159,11 @@ async def run_tests(
                     page = ctx_data["page"]
                     profile = ctx_data["profile"]
                     try:
-                        test_error = await page.evaluate("window.__testError__")
+                        results, test_error = await collect_results(page)
                         if test_error:
                             pr = {"profile": profile, "results": None, "grade": "F",
                                   "passCount": 0, "totalChecks": 0, "error": test_error}
                         else:
-                            results = await page.evaluate("window.__testResults__")
                             adjust_cross_os_font_checks(profile["os"], results)
                             pass_count, total_checks = count_all_checks(results)
                             grade = compute_grade(pass_count, total_checks)
@@ -192,7 +191,10 @@ async def run_tests(
     cross_profile = compute_cross_profile(profile_results)
     total_passed = sum(p["passCount"] for p in profile_results)
     total_checks_sum = sum(p["totalChecks"] for p in profile_results)
-    overall_grade = compute_grade(total_passed, total_checks_sum)
+    complete = bool(profile_results) and all(
+        not item.get("error") and item["totalChecks"] > 0 for item in profile_results
+    )
+    overall_grade = compute_grade(total_passed, total_checks_sum) if complete else "F"
 
     full_result = {
         "profiles": profile_results,
@@ -223,7 +225,7 @@ async def run_tests(
             )
             print(f"Certificate saved to: {save_cert}")
 
-    return 0 if overall_grade in ("A", "B") else 1
+    return 0 if complete and overall_grade in ("A", "B") else 1
 
 
 def main():
