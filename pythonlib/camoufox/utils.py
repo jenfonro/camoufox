@@ -42,6 +42,7 @@ from ._warnings import LeakWarning
 from .webgl import sample_webgl
 from .window import GEOMETRY_KEYS, effective_geometry, finish_window_options, validate_window_options
 from .graphics import validate_graphics_options
+from .seeds import validate_seed_options
 
 ListOrString: TypeAlias = Union[Tuple[str, ...], List[str], str]
 
@@ -230,6 +231,7 @@ def validate_config(config_map: Dict[str, str], path: Optional[Path] = None) -> 
     """
     validate_window_options(config_map)
     validate_graphics_options(config_map)
+    validate_seed_options(config_map)
     property_types = _load_properties(path=path)
 
     for key, value in config_map.items():
@@ -725,6 +727,7 @@ def launch_options(
         config = dict(config)
     validate_window_options(config)
     validate_graphics_options(config)
+    validate_seed_options(config)
     _explicit_global_geometry = (
         any(key in config for key in GEOMETRY_KEYS)
         or window is not None or screen is not None or fingerprint is not None

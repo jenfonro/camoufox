@@ -96,9 +96,9 @@
     "battery:level$__BATTERY": "double[>0]",
 
     "fonts": "array[str]",
-    "fonts:spacing_seed": "int[>=0]",
-    "audio:seed": "int[>=0]",
-    "canvas:seed": "int[>=0]",
+    "fonts:spacing_seed": "int[0-4294967295]",
+    "audio:seed": "int[0-4294967295]",
+    "canvas:seed": "int[0-4294967295]",
 
     "AudioContext:sampleRate": "int[>=0]",
     "AudioContext:outputLatency": "double[>=0]",

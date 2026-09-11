@@ -81,6 +81,8 @@ B 的完整哈希：`d7a82b5b9ab77050276436c08d7613ff09753148`。
   `1053/1054`。唯一共同失败是 Linux Global 的
   `Unstable: clientRects changed between collections`。它是旧内核也
   存在的失败，本次没有将其消除，也不能把该套件表述为全通过。
+  后续持久化分支已定位并修复这个异步字体回退问题，其最终包为
+  1054/1054；见[持久化验收](fingerprint-persistence-validation.md)。
 - service-tester：使用打包的 Python wheel 和本机 Mihomo 代理，最终
   固定的一组启动/上下文输入为 `765/765`。
 - 该套件的另一类基础画像组合会失败：固定 Windows 基础画像并创建
