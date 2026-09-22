@@ -158,12 +158,30 @@ def browser_scan_home(client, destination, navigate=True):
           const root=w.document.getElementById('browserscan');
           const app=root?.__vue_app__ || root?.__vueParentComponent?.appContext?.app;
           const nuxt=app?.config?.globalProperties?.$nuxt;
-          const cells={};
+          const cells={}, rawCells={}, excludedAds={};
           for (const cell of document.querySelectorAll('div._11xj7yu')) {
             const label=cell.querySelector('h3')?.textContent.trim();
-            if (label) cells[label]=cell.lastElementChild.innerText.trim();
+            if (!label) continue;
+            const value=cell.lastElementChild;
+            rawCells[label]=value.innerText.trim();
+            // Google inserts unrelated ad chips inside report values. Ads are
+            // an existing dynamic exclusion; retain their raw text as evidence.
+            // Hide only marked ad nodes while reading rendered report text,
+            // then restore their exact styles. No identity field is omitted.
+            const ads=Array.from(value.querySelectorAll('.google-anno-skip.google-anno-sc'));
+            const styles=ads.map(ad=>ad.getAttribute('style'));
+            if (ads.length) excludedAds[label]=ads.map(ad=>ad.innerText);
+            try {
+              for (const ad of ads) ad.style.setProperty('display','none','important');
+              cells[label]=value.innerText.trim();
+            } finally {
+              ads.forEach((ad,index)=>{
+                if (styles[index]===null) ad.removeAttribute('style');
+                else ad.setAttribute('style',styles[index]);
+              });
+            }
           }
-          return JSON.stringify({cells,state:nuxt?.payload?.state,
+          return JSON.stringify({cells,rawCells,excludedAds,state:nuxt?.payload?.state,
             rootProperties:root?Object.getOwnPropertyNames(root):[],
             appProperties:app?Object.keys(app.config.globalProperties):[],
             text:document.body.innerText,

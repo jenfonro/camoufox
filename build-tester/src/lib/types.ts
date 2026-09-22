@@ -39,7 +39,7 @@ export interface FingerprintData {
     unmaskedRenderer: string;
     maxTextureSize: number;
   } | null;
-  canvas: { hash: string; dataUrlPrefix: string };
+  canvas: { hash: string; pixelHash: string; dataUrlPrefix: string };
   audio: {
     hash: string;
     sampleRate: number;
@@ -54,7 +54,7 @@ export interface FingerprintData {
   };
   fonts: { measureWidth: number; hash: string };
   clientRects: { hash: string };
-  emojiCanvas: { hash: string };
+  emojiCanvas: { hash: string; pixelHash: string };
   fontAvailability: { detected: string[]; count: number; hash: string };
   speechVoices: { names: string[]; count: number; hash: string };
 }

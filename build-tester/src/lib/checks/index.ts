@@ -68,7 +68,14 @@ export async function runAllChecks(
   // Phase 6: Stability - collect fingerprints again and compare
   const fingerprints2 = await collectFingerprints();
   const diffs: string[] = [];
-  if (fingerprints.canvas.hash !== fingerprints2.canvas.hash) diffs.push("canvas");
+  for (const surface of ["canvas", "emojiCanvas"] as const) {
+    const first = fingerprints[surface];
+    const second = fingerprints2[surface];
+    if (!/^[0-9a-f]{64}$/.test(first.hash) || first.hash !== second.hash)
+      diffs.push(surface);
+    if (!/^[0-9a-f]{8}$/.test(first.pixelHash) || first.pixelHash !== second.pixelHash)
+      diffs.push(`${surface}Pixels`);
+  }
   if (fingerprints.audio.hash !== fingerprints2.audio.hash) diffs.push("audio");
   if (fingerprints.fonts.hash !== fingerprints2.fonts.hash) diffs.push("fonts");
   if (fingerprints.clientRects.hash !== fingerprints2.clientRects.hash) diffs.push("clientRects");

@@ -2,7 +2,7 @@
 
 import type { FingerprintData, WebRTCResult } from "../types";
 
-function simpleHash(data: Float32Array | Uint8Array): string {
+function simpleHash(data: Float32Array | Uint8Array | Uint8ClampedArray): string {
   let hash = 0;
   for (let i = 0; i < data.length; i++) {
     const val = data[i];
@@ -78,7 +78,7 @@ export async function collectFingerprints(): Promise<FingerprintData> {
       c.width = 200;
       c.height = 50;
       const ctx = c.getContext("2d");
-      if (!ctx) return { hash: "no-context", dataUrlPrefix: "" };
+      if (!ctx) return { hash: "no-context", pixelHash: "no-context", dataUrlPrefix: "" };
       ctx.textBaseline = "top";
       ctx.font = "14px Arial";
       ctx.fillStyle = "#f60";
@@ -88,9 +88,15 @@ export async function collectFingerprints(): Promise<FingerprintData> {
       ctx.fillStyle = "rgba(102, 204, 0, 0.7)";
       ctx.fillText("Cwm fjordbank", 4, 17);
       const url = c.toDataURL();
-      return { hash: await completeExportHash(url), dataUrlPrefix: url.substring(0, 30) };
+      // Keep both surfaces: pixel readback and the complete encoded export,
+      // whose trailing PNG metadata can change even when pixels stay stable.
+      return {
+        hash: await completeExportHash(url),
+        pixelHash: simpleHash(ctx.getImageData(0, 0, c.width, c.height).data),
+        dataUrlPrefix: url.substring(0, 30),
+      };
     } catch {
-      return { hash: "error", dataUrlPrefix: "" };
+      return { hash: "error", pixelHash: "error", dataUrlPrefix: "" };
     }
   })();
 
@@ -220,12 +226,15 @@ export async function collectFingerprints(): Promise<FingerprintData> {
       c.width = 200;
       c.height = 50;
       const ctx = c.getContext("2d");
-      if (!ctx) return { hash: "no-context" };
+      if (!ctx) return { hash: "no-context", pixelHash: "no-context" };
       ctx.font = "32px serif";
       ctx.fillText("\uD83D\uDE00\uD83D\uDC4D\uD83C\uDFE0\u2764\uFE0F", 0, 40);
-      return { hash: await completeExportHash(c.toDataURL()) };
+      return {
+        hash: await completeExportHash(c.toDataURL()),
+        pixelHash: simpleHash(ctx.getImageData(0, 0, c.width, c.height).data),
+      };
     } catch {
-      return { hash: "error" };
+      return { hash: "error", pixelHash: "error" };
     }
   })();
 

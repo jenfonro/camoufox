@@ -1,0 +1,8 @@
+{
+  "window:mode": "native",
+  "canvas:seed": 123456789,
+  "fonts": ["Arial", "Times New Roman", "Courier New"],
+  "navigator.language": "en-US",
+  "navigator.languages": ["en-US", "en"],
+  "timezone": "UTC"
+}
