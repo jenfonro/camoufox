@@ -1,8 +1,14 @@
 # 内核改动事项与已确认方案
 
-初次记录：2026-09-10。最近补充：2026-09-11。
+初次记录：2026-09-10。最近补充：2026-09-23。
 
-当前阶段：用户已明确授权完整实现并取回 Windows x64 内核测试；此前
+当前工作：通用本地控制接口已实现并完成 Windows x64 构建与验收，见
+[工作清单](native-control-plan.md)及
+[Windows x64 构建环境](windows-x64-build-environment.md)。
+统一交付分支为 `personal-use`。用户已授权将上游集成和原生控制接口
+一并纳入自用分支、推送到 origin，并清理已合并的临时分支。
+
+以下为已完成 WebGPU 阶段的历史状态：用户已明确授权完整实现并取回 Windows x64 内核测试；此前
 “暂不开始实现”的限制已被该指令取代。实现位于
 `codex/webgpu-configuration` 分支，已完成 Windows x64 构建与新增功能验收。
 产物和测试范围见 [验收记录](webgpu-validation.md)。
@@ -190,3 +196,31 @@ Worker 上下文字体种子传递。BrowserScan 八个完整画像哈希在同�
 
 管理器后续适配时应保存并回放完整有效配置与偏好。新的内核需求继续
 沿用本文件的职责边界，并单独记录其实施与验证结果。
+
+## 通用本地控制接口：已实现并验收
+
+2026-09-23：用户要求正常启动的 Camoufox 能被外部程序完整控制，
+无需启用 BiDi、Marionette、Juggler 调试会话或依赖普通扩展。
+新入口不向网页新增控制标记；实际不初始化相关调试链，
+不能仅修改检测字段或更换传输形式。
+
+本阶段只做 Camoufox 内核。auto-manager 是能力需求的参考，
+其 Agent、扩展/BiDi 移除和 VNC 收敛由管理器另行适配；
+不考虑 Chrome，不引入管理器或站点业务字段。
+接口以 Firefox 原生机制和标准浏览器对象为基础，采用通用、清晰的
+参数、版本、能力与错误语义。启动字段已确定为 `control:enabled`、
+`control:port`、`control:token`、`control:endpoint`；默认关闭。
+
+复用基线为已推送的 `codex/sync-upstream-20260923` / `e46a454`，
+包含此前窗口、WebGPU、持久化和表单/密码策略改动。
+详细源码依据、范围、未决项、实施步骤和严格验收标准已记录在工作清单，
+构建目录、代理与环境差异见构建环境文档。
+
+2026-09-23 实施完成：英文功能分支 `codex/native-control-api`，
+独立内置组件与窗口 Actor、ChromeOnly 原生页面执行、浏览器 widget 输入、
+本地鉴权协议及独立客户端已落地。Windows x64 最终包已取回并验收。
+真实布局与画像继续独立，三次正常重启的完整原生指纹及网站报告一致，
+既有窗口、WebGPU、种子和表单/密码机制通过回归。
+字段与能力见 [API](native-control-api.md)，产物、校验和验证边界见
+[最终验收](native-control-verification.md)。最终提交并推送的目标为
+`origin/personal-use`，包含上游集成与本次功能；本阶段未发布 Release。

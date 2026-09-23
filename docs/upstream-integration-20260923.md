@@ -1,7 +1,14 @@
 # 上游合并与 Windows x64 验证
 
-本次在 `codex/sync-upstream-20260923` 集成上游；`personal-use` 保持在
-`cc9f5250a2002426e6988cb2decb17ccaa501425`。未推送、未发布。
+上游集成最初在 `codex/sync-upstream-20260923` 完成；当时 `personal-use`
+位于 `cc9f5250a2002426e6988cb2decb17ccaa501425`。
+集成与验证结果已提交为 `e46a454bc4528638128df3437f7f18a04e66afc6`，
+并按用户要求推送至 `origin/codex/sync-upstream-20260923`；未发布 Release。
+用户随后要求将该上游集成与原生控制接口一并汇总到 `personal-use`，
+以自用分支作为最终推送目标，再清理已合并的临时分支。
+历史分支清理后，可通过以上提交在自用分支历史中检索本次集成。
+2026-09-23 续接时已核对远端提交；当前环境与复用方法见
+[Windows x64 构建环境](windows-x64-build-environment.md)。
 
 - 上游提交：`5e59b70bdd4765a76f2ca50899707ef0622b9368`。
 - 共同基线：`b6aa72ea5a97851bb9f56164efa974d751e36b31`。

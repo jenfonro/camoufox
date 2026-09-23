@@ -6,6 +6,14 @@ juggler.jar:
 % content juggler %content/
 
   content/components/Juggler.js (components/Juggler.js)
+  content/components/ControlStartup.sys.mjs (components/ControlStartup.sys.mjs)
+  content/control/ControlService.sys.mjs (control/ControlService.sys.mjs)
+  content/control/ControlBrowser.sys.mjs (control/ControlBrowser.sys.mjs)
+  content/control/ControlChild.sys.mjs (control/ControlChild.sys.mjs)
+  content/control/ControlParent.sys.mjs (control/ControlParent.sys.mjs)
+  content/control/ControlInput.sys.mjs (control/ControlInput.sys.mjs)
+  content/control/ControlNetwork.sys.mjs (control/ControlNetwork.sys.mjs)
+  content/control/ControlUtils.sys.mjs (control/ControlUtils.sys.mjs)
 
   content/Helper.js (Helper.js)
   content/input/MouseDispatch.js (input/MouseDispatch.js)
@@ -28,4 +36,3 @@ juggler.jar:
   content/content/Runtime.js (content/Runtime.js)
   content/content/WorkerMain.js (content/WorkerMain.js)
   content/content/hidden-scrollbars.css (content/hidden-scrollbars.css)
-

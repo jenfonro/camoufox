@@ -1,0 +1,92 @@
+diff --git a/dom/base/ChromeUtils.cpp b/dom/base/ChromeUtils.cpp
+--- a/dom/base/ChromeUtils.cpp
++++ b/dom/base/ChromeUtils.cpp
+@@ -19,6 +19,8 @@
+ #include "imgLoader.h"
+ #include "js/CallAndConstruct.h"  // JS::Call
+ #include "js/CharacterEncoding.h"
++#include "js/CompilationAndEvaluation.h"
++#include "js/SourceText.h"
+ #include "js/ColumnNumber.h"  // JS::TaggedColumnNumberOneOrigin, JS::ColumnNumberOneOrigin
+ #include "js/Date.h"  // JS::IsISOStyleDate
+ #include "js/JSON.h"
+@@ -2752,6 +2754,49 @@
+ }
+ 
+ /* static */
++void ChromeUtils::CamouEvaluateInPage(GlobalObject& aGlobal,
++                                    WindowProxyHolder& aWindow,
++                                    const nsAString& aExpression,
++                                    JS::MutableHandle<JS::Value> aResult,
++                                    ErrorResult& aRv) {
++  nsPIDOMWindowOuter* outer = aWindow.get()->GetDOMWindow();
++  RefPtr<nsGlobalWindowInner> inner =
++      outer ? nsGlobalWindowInner::Cast(outer->GetCurrentInnerWindow()) : nullptr;
++  if (!inner || !inner->GetExtantDoc() || !inner->GetGlobalJSObject()) {
++    aRv.ThrowInvalidStateError("The page document is no longer available");
++    return;
++  }
++  if (inner->GetExtantDoc()->NodePrincipal()->IsSystemPrincipal()) {
++    aRv.ThrowSecurityError("Page execution does not accept privileged documents");
++    return;
++  }
++
++  // This is a chrome-only embedder operation in the document's own realm. It
++  // does not call a page-replaceable eval function, attach a Debugger, or alter
++  // the document's CSP. Scripts subsequently run by the page retain normal CSP
++  // and content-principal checks.
++  JSContext* cx = aGlobal.Context();
++  JS::Rooted<JS::Value> result(cx);
++  {
++    JSAutoRealm realm(cx, inner->GetGlobalJSObject());
++    JS::CompileOptions options(cx);
++    options.setFileAndLine("camoufox-control", 1);
++    JS::SourceText<char16_t> text;
++    if (!text.init(cx, aExpression.BeginReading(), aExpression.Length(),
++                   JS::SourceOwnership::Borrowed) ||
++        !JS::Evaluate(cx, options, text, &result)) {
++      aRv.NoteJSContextException(cx);
++      return;
++    }
++  }
++  if (!JS_WrapValue(cx, &result)) {
++    aRv.NoteJSContextException(cx);
++    return;
++  }
++  aResult.set(result);
++}
++
++/* static */
+ double ChromeUtils::CamouGetDouble(GlobalObject& aGlobal,
+                                    const nsAString& aVarName,
+                                    double aDefaultValue) {
+diff --git a/dom/base/ChromeUtils.h b/dom/base/ChromeUtils.h
+--- a/dom/base/ChromeUtils.h
++++ b/dom/base/ChromeUtils.h
+@@ -358,6 +358,12 @@
+                                          WindowProxyHolder& aWindow,
+                                          nsTArray<double>& aResult);
+ 
++  static void CamouEvaluateInPage(GlobalObject& aGlobal,
++                                  WindowProxyHolder& aWindow,
++                                  const nsAString& aExpression,
++                                  JS::MutableHandle<JS::Value> aResult,
++                                  ErrorResult& aRv);
++
+   static double CamouGetDouble(GlobalObject& aGlobal, const nsAString& aVarName,
+                                double aDefaultValue);
+ 
+diff --git a/dom/chrome-webidl/ChromeUtils.webidl b/dom/chrome-webidl/ChromeUtils.webidl
+--- a/dom/chrome-webidl/ChromeUtils.webidl
++++ b/dom/chrome-webidl/ChromeUtils.webidl
+@@ -931,6 +931,10 @@
+    * Get a double value from Camoufox MaskConfig.
+    */
+   double camouGetDouble(DOMString varName, double defaultValue);
++
++  /** Native local-control execution in a content window's realm. */
++  [ChromeOnly, Throws]
++  any camouEvaluateInPage(WindowProxy window, DOMString expression);
+ 
+   /**
+    * Get a bool value from Camoufox MaskConfig.

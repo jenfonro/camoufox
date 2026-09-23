@@ -4,21 +4,22 @@
 
 // Services is available as a global in XPCOM component context
 
-// Load SimpleChannel in browser-process global.
-Services.scriptloader.loadSubScript('chrome://juggler/content/SimpleChannel.js');
-const {Dispatcher} = ChromeUtils.importESModule("chrome://juggler/content/protocol/Dispatcher.js");
-const {BrowserHandler} = ChromeUtils.importESModule("chrome://juggler/content/protocol/BrowserHandler.js");
-const {NetworkObserver} = ChromeUtils.importESModule("chrome://juggler/content/NetworkObserver.js");
-const {TargetRegistry} = ChromeUtils.importESModule("chrome://juggler/content/TargetRegistry.js");
-const {Helper} = ChromeUtils.importESModule('chrome://juggler/content/Helper.js');
-const {ActorManagerParent} = ChromeUtils.importESModule('resource://gre/modules/ActorManagerParent.sys.mjs');
-const helper = new Helper();
+let Dispatcher, BrowserHandler, NetworkObserver, TargetRegistry;
 
 const Cc = Components.classes;
 const Ci = Components.interfaces;
 
-// Register JSWindowActors that will be instantiated for each frame.
-ActorManagerParent.addJSWindowActors({
+// Only explicit Juggler startup may load its execution environment or register
+// its actors. Merely loading this profile observer must not attach a Debugger
+// to every ordinary page.
+function initializeJuggler() {
+  Services.scriptloader.loadSubScript('chrome://juggler/content/SimpleChannel.js');
+  ({Dispatcher} = ChromeUtils.importESModule("chrome://juggler/content/protocol/Dispatcher.js"));
+  ({BrowserHandler} = ChromeUtils.importESModule("chrome://juggler/content/protocol/BrowserHandler.js"));
+  ({NetworkObserver} = ChromeUtils.importESModule("chrome://juggler/content/NetworkObserver.js"));
+  ({TargetRegistry} = ChromeUtils.importESModule("chrome://juggler/content/TargetRegistry.js"));
+  const {ActorManagerParent} = ChromeUtils.importESModule('resource://gre/modules/ActorManagerParent.sys.mjs');
+  ActorManagerParent.addJSWindowActors({
   JugglerFrame: {
     parent: {
       esModuleURI: 'chrome://juggler/content/JugglerFrameParent.sys.mjs',
@@ -40,7 +41,8 @@ ActorManagerParent.addJSWindowActors({
     },
     allFrames: true,
   },
-});
+  });
+}
 
 let browserStartupFinishedCallback;
 let browserStartupFinishedPromise = new Promise(x => browserStartupFinishedCallback = x);
@@ -69,15 +71,19 @@ export class Juggler {
     switch (topic) {
       case "profile-after-change":
         Services.obs.addObserver(this, "command-line-startup");
-        Services.obs.addObserver(this, "browser-idle-startup-tasks-finished");
         break;
       case "command-line-startup":
         Services.obs.removeObserver(this, topic);
         const cmdLine = subject;
+        // Leave conflicting flags visible to ControlStartup's validation.
+        if (ChromeUtils.camouGetBool("control:enabled", false))
+          return;
         const jugglerPipeFlag = cmdLine.handleFlag('juggler-pipe', false);
         if (!jugglerPipeFlag)
           return;
 
+        initializeJuggler();
+        Services.obs.addObserver(this, "browser-idle-startup-tasks-finished");
         this._silent = cmdLine.findFlag('silent', false) >= 0;
         if (this._silent) {
           Services.startup.enterLastWindowClosingSurvivalArea();
@@ -157,4 +163,3 @@ const jugglerInstance = new Juggler();
 export var JugglerFactory = function() {
   return jugglerInstance;
 };
-

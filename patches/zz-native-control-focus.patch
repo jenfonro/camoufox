@@ -1,0 +1,19 @@
+diff --git a/dom/base/nsFocusManager.cpp b/dom/base/nsFocusManager.cpp
+--- a/dom/base/nsFocusManager.cpp
++++ b/dom/base/nsFocusManager.cpp
+@@ -1875,9 +1875,12 @@
+         (GetActiveBrowsingContext() == newRootBrowsingContext);
+   }
+ 
+-  // In Playwright, we want to send focus events even if the element
+-  // isn't actually in the active window.
+-  isElementInActiveWindow = true;
++  // Only the explicitly enabled Juggler actor opts into focus emulation.
++  // Ordinary browsing and native control retain the real active-window check.
++  if (nsIDocShell* docShell = aNewContent->OwnerDoc()->GetDocShell();
++      docShell && nsDocShell::Cast(docShell)->ShouldOverrideHasFocus()) {
++    isElementInActiveWindow = true;
++  }
+ 
+   // Exit fullscreen if a website focuses another window
+   if (StaticPrefs::full_screen_api_exit_on_windowRaise() &&

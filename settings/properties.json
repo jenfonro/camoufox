@@ -1,4 +1,8 @@
 [
+  { "property": "control:enabled", "type": "bool" },
+  { "property": "control:port", "type": "uint" },
+  { "property": "control:token", "type": "str" },
+  { "property": "control:endpoint", "type": "str" },
   { "property": "navigator.userAgent", "type": "str" },
   { "property": "navigator.doNotTrack", "type": "str" },
   { "property": "navigator.appCodeName", "type": "str" },

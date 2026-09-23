@@ -25,7 +25,7 @@
  * the build if it does. See docs/input-dispatch.md.
  */
 
-const {setTimeout} = ChromeUtils.importESModule('resource://gre/modules/Timer.sys.mjs');
+const {setTimeout, clearTimeout} = ChromeUtils.importESModule('resource://gre/modules/Timer.sys.mjs');
 
 /**
  * How long to wait for a juggler-mouse-event-hit-renderer ack before giving up.
@@ -61,15 +61,26 @@ function warnUndelivered(eventType, x, y, box, deadlineMs) {
 }
 
 export class MouseDispatch {
+  // A content actor already has content-relative coordinates. Drag-and-drop
+  // uses the existing native drag session; it must not start a mouse ack wait.
+  static sendContentDrag(win, type, x, y, modifiers) {
+    return win.windowUtils.jugglerSendMouseEvent(type, x, y, 0, 0, modifiers,
+      false, 0.0, 0, true, false, 0,
+      win.windowUtils.DEFAULT_MOUSE_POINTER_ID, false);
+  }
+
   /**
    * @param {Window} win chrome window owning the browser element.
    * @param {DOMRect} boundingBox the browser element's rect, already measured.
    * @param {object} eventArgs button / clickCount / modifiers / buttons.
    */
-  constructor(win, boundingBox, {button = 0, clickCount = 0, modifiers = 0, buttons = 0} = {}) {
+  constructor(win, boundingBox, {button = 0, clickCount = 0, modifiers = 0, buttons = 0,
+    coordinateScaleX = 1, coordinateScaleY = 1} = {}) {
     this._win = win;
     this._box = boundingBox;
     this._args = {button, clickCount, modifiers, buttons};
+    this._coordinateScaleX = coordinateScaleX;
+    this._coordinateScaleY = coordinateScaleY;
 
     // The first whole pixel inside the browser element on each axis.
     //
@@ -109,6 +120,23 @@ export class MouseDispatch {
     return new MouseDispatch(win, linkedBrowser.getBoundingClientRect(), eventArgs);
   }
 
+  static forNativeBrowser(win, linkedBrowser, eventArgs, viewport) {
+    // Content CSS pixels shrink under full-page zoom; the containing browser
+    // rect and parent event coordinates are chrome CSS pixels. Native zoom is
+    // independent of any reported window/profile DPR.
+    // Use measured layout, not requested fullZoom: Gecko rounds app units per
+    // device pixel (e.g. requested 1.1 can render at 60/55). That difference
+    // otherwise misses small targets near the viewport's far edge.
+    const box = linkedBrowser.getBoundingClientRect();
+    return new MouseDispatch(win, box, {...eventArgs,
+      coordinateScaleX: box.width / viewport.width,
+      coordinateScaleY: box.height / viewport.height});
+  }
+
+  get contentScale() {
+    return this._coordinateScaleX;
+  }
+
   get boundingBox() {
     return this._box;
   }
@@ -123,14 +151,15 @@ export class MouseDispatch {
    * constructor's snap is what makes it safe to dispatch.
    */
   isInViewport(x, y) {
-    return x >= 0 && y >= 0 && x < this._box.width && y < this._box.height;
+    return x >= 0 && y >= 0 && x * this._coordinateScaleX < this._box.width &&
+      y * this._coordinateScaleY < this._box.height;
   }
 
   /** Relative point -> absolute, snapped clear of both of the element's edges. */
   toAbsolute(x, y) {
     return {
-      x: Math.min(Math.max(x + this._box.left, this._originX), this._limitX),
-      y: Math.min(Math.max(y + this._box.top, this._originY), this._limitY),
+      x: Math.min(Math.max(x * this._coordinateScaleX + this._box.left, this._originX), this._limitX),
+      y: Math.min(Math.max(y * this._coordinateScaleY + this._box.top, this._originY), this._limitY),
     };
   }
 
@@ -171,6 +200,32 @@ export class MouseDispatch {
     if (!ack)
       warnUndelivered(eventType, x, y, this._box, deadlineMs);
     return ack;
+  }
+
+  /**
+   * Firefox's native completion callback follows the event through APZ and
+   * out-of-process frames. Native control must use this path: synchronous
+   * widget DispatchEvent can hit an OOP iframe element instead of its content.
+   * Keep the same coordinate guards and deadline as the legacy Juggler path.
+   */
+  sendNativeAcked(eventType, x, y, deadlineMs = kAckDeadlineMs) {
+    const absolute = this.toAbsolute(x, y);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        warnUndelivered(eventType, x, y, this._box, deadlineMs);
+        resolve(false);
+      }, deadlineMs);
+      try {
+        this._win.synthesizeMouseEvent(eventType, absolute.x, absolute.y,
+          {...this._args, inputSource: 1},
+          {isAsyncEnabled: true, isDOMEventSynthesized: true,
+            isWidgetEventSynthesized: false},
+          () => { clearTimeout(timer); resolve(true); });
+      } catch (error) {
+        clearTimeout(timer);
+        reject(error);
+      }
+    });
   }
 
   /**
@@ -225,5 +280,26 @@ export class MouseDispatch {
       lineOrPageDeltaX,
       lineOrPageDeltaY,
       0 /* options */);
+  }
+
+  sendNativeWheelAcked(x, y, {deltaX, deltaY, deltaZ, deltaMode, lineOrPageDeltaX, lineOrPageDeltaY},
+                      deadlineMs = kAckDeadlineMs) {
+    const point = this.toAbsolute(x, y);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => resolve(false), deadlineMs);
+      const callback = {
+        QueryInterface: ChromeUtils.generateQI(["nsISynthesizedEventCallback"]),
+        onCompleteDispatch() { clearTimeout(timer); resolve(true); },
+      };
+      try {
+        this._win.windowUtils.sendWheelEvent(point.x, point.y,
+          deltaX, deltaY, deltaZ, deltaMode, this._args.modifiers,
+          lineOrPageDeltaX, lineOrPageDeltaY,
+          this._win.windowUtils.WHEEL_EVENT_ASYNC_ENABLED, callback);
+      } catch (error) {
+        clearTimeout(timer);
+        reject(error);
+      }
+    });
   }
 }

@@ -254,6 +254,14 @@ class NetworkRequest {
 
   // nsIInterfaceRequestor
   getInterface(iid) {
+    // Native control preserves the browser's ordinary authentication prompts.
+    // The Playwright path keeps its existing explicit-credentials behavior.
+    if (this._networkObserver._targetRegistry.preserveNativeAuth &&
+        (iid.equals(Ci.nsIAuthPrompt2) || iid.equals(Ci.nsIAuthPromptProvider) || iid.equals(Ci.nsIAuthPrompt))) {
+      if (this._previousCallbacks)
+        return this._previousCallbacks.getInterface(iid);
+      throw Cr.NS_ERROR_NO_INTERFACE;
+    }
     if (iid.equals(Ci.nsIAuthPrompt2) || iid.equals(Ci.nsIAuthPromptProvider) || iid.equals(Ci.nsINetworkInterceptController))
       return this;
     if (iid.equals(Ci.nsIAuthPrompt))  // Block nsIAuthPrompt - we want nsIAuthPrompt2 to be used instead.
@@ -455,6 +463,8 @@ class NetworkRequest {
     const pageNetwork = this._pageNetwork;
     if (!pageNetwork)
       return false;
+    if (this._networkObserver._targetRegistry.shouldIntercept)
+      return this._networkObserver._targetRegistry.shouldIntercept(this.httpChannel);
     if (pageNetwork._requestInterceptionEnabled)
       return true;
     const browserContext = pageNetwork._target.browserContext();
@@ -641,9 +651,10 @@ export class NetworkObserver {
     protocolProxyService.registerChannelFilter(this._channelProxyFilter, 0 /* position */);
 
     // Register self as ChannelEventSink to track redirects.
-    ChannelEventSinkFactory.getService().registerCollector({
+    this._redirectCollector = {
       _onChannelRedirect: this._onRedirect.bind(this),
-    });
+    };
+    ChannelEventSinkFactory.getService().registerCollector(this._redirectCollector);
 
     this._eventListeners = [
       helper.addObserver(this._onRequest.bind(this), 'http-on-modify-request'),
@@ -685,6 +696,8 @@ export class NetworkObserver {
     if (!(channel instanceof Ci.nsIHttpChannel))
       return;
     const httpChannel = channel.QueryInterface(Ci.nsIHttpChannel);
+    if (this._targetRegistry.shouldObserve && !this._targetRegistry.shouldObserve(httpChannel))
+      return;
     const channelId = httpChannel.channelId + '';
     const redirectedFrom = this._expectedRedirect.get(channelId);
     if (redirectedFrom) {
@@ -714,9 +727,14 @@ export class NetworkObserver {
   }
 
   dispose() {
-    this._activityDistributor.removeObserver(this);
-    ChannelEventSinkFactory.unregister();
+    if (this._activityDistributor)
+      this._activityDistributor.removeObserver(this);
+    Cc['@mozilla.org/network/protocol-proxy-service;1'].getService()
+      .unregisterChannelFilter(this._channelProxyFilter);
+    ChannelEventSinkFactory.getService().unregisterCollector(this._redirectCollector);
     helper.removeListeners(this._eventListeners);
+    if (NetworkObserver._instance === this)
+      NetworkObserver._instance = null;
   }
 }
 
@@ -1063,4 +1081,3 @@ PageNetwork.Events = {
   RequestFinished: Symbol('PageNetwork.Events.RequestFinished'),
   RequestFailed: Symbol('PageNetwork.Events.RequestFailed'),
 };
-

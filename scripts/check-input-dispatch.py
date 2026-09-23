@@ -51,6 +51,7 @@ CONTENT_ACK_SOURCE = "additions/juggler/content/FrameTree.js"
 
 # (regex, what the code is doing, files exempt in addition to the chokepoint)
 RULES = [
+    (r"\bsynthesizeMouseEvent\s*\(", "dispatches a native mouse event", set()),
     (r"\bjugglerSendMouseEvent\s*\(", "dispatches a synthesized mouse event", {CONTENT_DRAG}),
     (r"\bsendWheelEvent\s*\(", "dispatches a synthesized wheel event", set()),
     (r"\bjugglerEventId\b", "waits for a renderer ack", {CONTENT_ACK_SOURCE}),
@@ -73,7 +74,8 @@ def main() -> int:
     compiled = [(re.compile(p), what, exempt) for p, what, exempt in RULES]
     violations = []
 
-    for path in sorted(SCAN_ROOT.rglob("*.js")):
+    sources = sorted(p for p in SCAN_ROOT.rglob("*") if p.suffix in {".js", ".mjs"})
+    for path in sources:
         rel = path.relative_to(ROOT).as_posix()
         if rel == CHOKEPOINT or path.name.endswith(".bak"):
             continue
@@ -87,7 +89,7 @@ def main() -> int:
                     violations.append((rel, lineno, what, line.strip()))
 
     if not violations:
-        scanned = sum(1 for _ in SCAN_ROOT.rglob("*.js"))
+        scanned = len(sources)
         print(f"input-dispatch: ok -- {scanned} files scanned, all synthesized input "
               f"goes through {CHOKEPOINT}")
         return 0
