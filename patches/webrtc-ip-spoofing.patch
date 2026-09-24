@@ -355,22 +355,22 @@ index 063843934e..11736cc985 100644
  
    void ForgetSharedWorker(mozilla::dom::SharedWorker* aSharedWorker);
 diff --git a/dom/media/webrtc/jsapi/PeerConnectionImpl.cpp b/dom/media/webrtc/jsapi/PeerConnectionImpl.cpp
-index 91f927902f..b1f3c6980d 100644
+index e9afe2cfb2..fce2ca6145 100644
 --- a/dom/media/webrtc/jsapi/PeerConnectionImpl.cpp
 +++ b/dom/media/webrtc/jsapi/PeerConnectionImpl.cpp
-@@ -99,6 +99,11 @@
+@@ -98,6 +98,11 @@
  #include "mozilla/glean/DomMediaWebrtcMetrics.h"
  #include "mozilla/net/DataChannelProtocol.h"
  #include "mozilla/net/WebrtcProxyConfig.h"
 +#include "MaskConfig.hpp"
 +#include "mozilla/RandomNum.h"
-+#include "mozilla/RustRegex.h"
++#include "prnetdb.h"
 +#include "WebRTCIPManager.h"
 +#include "nsDocShell.h"
  #include "nsContentUtils.h"
  #include "nsDOMJSUtils.h"
  #include "nsGlobalWindowInner.h"
-@@ -228,6 +233,14 @@ class DataChannel;
+@@ -227,6 +232,14 @@ class DataChannel;
  
  namespace mozilla {
  
@@ -385,7 +385,7 @@ index 91f927902f..b1f3c6980d 100644
  void PeerConnectionAutoTimer::RegisterConnection() { mRefCnt++; }
  
  void PeerConnectionAutoTimer::UnregisterConnection(bool aContainedAV) {
-@@ -1592,7 +1605,15 @@ PeerConnectionImpl::SetLocalDescription(int32_t aAction, const char* aSDP) {
+@@ -1585,7 +1598,15 @@ PeerConnectionImpl::SetLocalDescription(int32_t aAction, const char* aSDP) {
      }
    };
  
@@ -480,7 +480,7 @@ index 91f927902f..b1f3c6980d 100644
              RefPtr<RTCStatsReport> report(new RTCStatsReport(window));
              report->Incorporate(*aReport);
              promise->MaybeResolve(std::move(report));
-@@ -3260,12 +3345,22 @@ const std::string& PeerConnectionImpl::GetName() {
+@@ -3274,12 +3359,22 @@ const std::string& PeerConnectionImpl::GetName() {
    return mName;
  }
  
@@ -504,7 +504,7 @@ index 91f927902f..b1f3c6980d 100644
    if (mForceIceTcp && std::string::npos != candidate.find(" UDP ")) {
      CSFLogWarn(LOGTAG, "Blocking local UDP candidate: %s", candidate.c_str());
      STAMP_TIMECARD(mTimeCard, "UDP Ice Candidate blocked");
-@@ -3328,10 +3423,393 @@ void PeerConnectionImpl::SendLocalIceCandidateToContent(
+@@ -3342,10 +3437,299 @@ void PeerConnectionImpl::SendLocalIceCandidateToContent(
      uint16_t level, const std::string& mid, const std::string& candidate,
      const std::string& ufrag) {
    STAMP_TIMECARD(mTimeCard, "Send Ice Candidate to content");
@@ -549,80 +549,17 @@ index 91f927902f..b1f3c6980d 100644
 +          ip.compare(0, 4, "fe80") == 0);
 +}
 +
-+bool isPrivateIP(const std::string& ip) {
-+  // Check if an IP is on a private network
-+  // Use colons AND no periods to avoid IPv4:port false positives
-+  bool isIPv6 = (ip.find(':') != std::string::npos) && (ip.find('.') == std::string::npos);
-+  
-+  if (isIPv6) {
-+    // check for private ipv6 (fc00::/7)
-+    return (ip.length() >= 4 && 
-+            ((ip[0] == 'f' || ip[0] == 'F') && 
-+             (ip[1] == 'c' || ip[1] == 'd' || 
-+              ip[1] == 'C' || ip[1] == 'D')));
-+  } else {
-+    // check ipv4 private ranges (RFC1918)
-+    return (ip.compare(0, 8, "192.168.") == 0 || 
-+            ip.compare(0, 3, "10.") == 0 || 
-+            (ip.compare(0, 4, "172.") == 0 && 
-+             ip.length() >= 7 && 
-+             ip[4] >= '1' && ip[4] <= '3' && 
-+             (ip[5] >= '0' && ip[5] <= '9')));
++std::string getMaskForIP(const std::string& ip) {
++  if (ip.find_first_of(".:") == std::string::npos || isSpecialIP(ip)) {
++    return ip;
 +  }
-+}
-+
-+std::string getMaskForIP(const std::string& ip, uint32_t userContextId) {
-+  // Get the corresponding mask for an ip address
-+  if (isSpecialIP(ip)) {
-+    return ip;  // dont mask special IPs
++  PRNetAddr address{};
++  if (PR_StringToNetAddr(ip.c_str(), &address) != PR_SUCCESS) {
++    return ip;
 +  }
-+  // Use colons AND no periods to avoid IPv4:port false positives
-+  bool isIPv6 = (ip.find(':') != std::string::npos) && (ip.find('.') == std::string::npos);
-+
-+  auto ipv4Value = MaskConfig::GetString("webrtc:ipv4");
-+  auto ipv6Value = MaskConfig::GetString("webrtc:ipv6");
-+
-+  if (isIPv6) {
-+    if (ipv6Value) {
-+      return ipv6Value.value();
-+    }
-+  } else {
-+    if (ipv4Value) {
-+      return ipv4Value.value();
-+    }
-+  }
-+  // return original ip if no mask is available
-+  return ip;
-+}
-+
-+std::string replaceIPAddresses(
-+    const std::string& input, const char* pattern, uint32_t userContextId) {
-+  // Replace IP addresses in a output line
-+  mozilla::RustRegex regex(pattern);
-+  if (!regex.IsValid()) {
-+    return input;
-+  }
-+  
-+  std::string result;
-+  auto iter = regex.IterMatches(input);
-+  size_t lastEnd = 0;
-+  
-+  while (auto match = iter.Next()) {
-+    std::string ip = input.substr(match->start, match->end - match->start);
-+    std::string mask = getMaskForIP(ip, userContextId);
-+    
-+    if (mask != ip) {
-+      result.append(input, lastEnd, match->start - lastEnd);
-+      result.append(mask);
-+    } else {
-+      result.append(input, lastEnd, match->end - lastEnd);
-+    }
-+    
-+    lastEnd = match->end;
-+  }
-+  
-+  result.append(input, lastEnd);
-+  return result;
++  const char* key = address.raw.family == PR_AF_INET6 ? "webrtc:ipv6"
++                                                     : "webrtc:ipv4";
++  return MaskConfig::GetString(key).value_or(ip);
 +}
 +
 +std::string PeerConnectionImpl::SpoofCandidateIP(const std::string& candidate) {
@@ -630,20 +567,32 @@ index 91f927902f..b1f3c6980d 100644
 +    return candidate;
 +  }
 +
-+  uint32_t userContextId = 0;
-+  if (mWindow) {
-+    if (BrowsingContext* bc = mWindow->GetBrowsingContext()) {
-+      userContextId = bc->OriginAttributesRef().mUserContextId;
++  // Parse complete address fields. An unanchored IPv6 expression can match
++  // only the prefix of a compressed address and leave an invalid suffix.
++  std::string result;
++  size_t offset = 0;
++  size_t field = 0;
++  bool relatedAddress = false;
++  while (offset < candidate.size()) {
++    const size_t start = candidate.find_first_not_of(" \t\r\n", offset);
++    if (start == std::string::npos) {
++      result.append(candidate, offset, std::string::npos);
++      break;
 +    }
++    result.append(candidate, offset, start - offset);
++    const size_t end = candidate.find_first_of(" \t\r\n", start);
++    const size_t length =
++        (end == std::string::npos ? candidate.size() : end) - start;
++    const std::string token = candidate.substr(start, length);
++    // Field 0 also covers a standalone address (SDP origin/connection and
++    // stats). ICE candidates put their address at field 4 and after raddr.
++    result += (field == 0 || field == 4 || relatedAddress)
++                  ? getMaskForIP(token)
++                  : token;
++    relatedAddress = token == "raddr";
++    ++field;
++    offset = start + length;
 +  }
-+
-+  // ipv4
-+  const char* ipv4Pattern = "(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)";
-+  std::string result = replaceIPAddresses(candidate, ipv4Pattern, userContextId);
-+  // ipv6 - comprehensive pattern handles all formats including compressed (::1, fe80::, etc.)
-+  const char* ipv6Pattern = "(?:(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,7}:|(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,5}(?::[0-9A-Fa-f]{1,4}){1,2}|(?:[0-9A-Fa-f]{1,4}:){1,4}(?::[0-9A-Fa-f]{1,4}){1,3}|(?:[0-9A-Fa-f]{1,4}:){1,3}(?::[0-9A-Fa-f]{1,4}){1,4}|(?:[0-9A-Fa-f]{1,4}:){1,2}(?::[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:(?::[0-9A-Fa-f]{1,4}){1,6}|:(?::[0-9A-Fa-f]{1,4}){1,7}|::)";
-+  result = replaceIPAddresses(result, ipv6Pattern, userContextId);
-+
 +  return result;
 +}
 +
@@ -652,48 +601,29 @@ index 91f927902f..b1f3c6980d 100644
 +    return NS_OK;
 +  }
 +
-+  uint32_t userContextId = 0;
-+  if (mWindow) {
-+    if (BrowsingContext* bc = mWindow->GetBrowsingContext()) {
-+      userContextId = bc->OriginAttributesRef().mUserContextId;
-+    }
-+  }
-+
-+  // process the SDP line by line to handle candidate lines
-+  std::istringstream iss(sdp);
-+  std::ostringstream oss;
++  std::istringstream input(sdp);
++  std::ostringstream output;
 +  std::string line;
-+
-+  while (std::getline(iss, line)) {
-+    // process candidates and other lines that might contain IPs
++  while (std::getline(input, line)) {
++    // getline removes LF but retains CR. Restore a complete CRLF below.
++    if (!line.empty() && line.back() == '\r') {
++      line.pop_back();
++    }
 +    if (line.compare(0, 12, "a=candidate:") == 0) {
-+      std::string processed = SpoofCandidateIP(line);
-+      if (processed != line) {
-+        line = processed;
++      line = SpoofCandidateIP(line);
++    } else if (line.compare(0, 2, "c=") == 0 ||
++               line.compare(0, 2, "o=") == 0) {
++      // Only the final field is an address. DTLS fingerprints and other
++      // colon-separated values elsewhere in SDP are not IPv6 addresses.
++      const size_t addressStart = line.find_last_of(" \t");
++      if (addressStart != std::string::npos) {
++        const std::string address = line.substr(addressStart + 1);
++        line.replace(addressStart + 1, address.size(), SpoofCandidateIP(address));
 +      }
 +    }
-+    // add line back with proper line ending
-+    if (line.empty() || (line.back() != '\r' && line.back() != '\n')) {
-+      oss << line << "\r\n";
-+    } else {
-+      oss << line;
-+    }
++    output << line << "\r\n";
 +  }
-+  // process the entire SDP for any remaining IP addresses
-+  std::string processedSdp = oss.str();
-+  std::string originalSdp = processedSdp;
-+  
-+  // ipv4
-+  const char* ipv4Pattern = "(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)";
-+  processedSdp = replaceIPAddresses(processedSdp, ipv4Pattern, userContextId);
-+  // ipv6 - comprehensive pattern handles all formats including compressed (::1, fe80::, etc.)
-+  const char* ipv6Pattern = "(?:(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,7}:|(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,5}(?::[0-9A-Fa-f]{1,4}){1,2}|(?:[0-9A-Fa-f]{1,4}:){1,4}(?::[0-9A-Fa-f]{1,4}){1,3}|(?:[0-9A-Fa-f]{1,4}:){1,3}(?::[0-9A-Fa-f]{1,4}){1,4}|(?:[0-9A-Fa-f]{1,4}:){1,2}(?::[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:(?::[0-9A-Fa-f]{1,4}){1,6}|:(?::[0-9A-Fa-f]{1,4}){1,7}|::)";
-+  processedSdp = replaceIPAddresses(processedSdp, ipv6Pattern, userContextId);
-+  
-+  if (processedSdp != originalSdp) {
-+    sdp = processedSdp;
-+  }
-+
++  sdp = output.str();
 +  return NS_OK;
 +}
 +
@@ -731,13 +661,6 @@ index 91f927902f..b1f3c6980d 100644
 +  }
 +  uint32_t span = static_cast<uint32_t>(hi - lo) + 1u;
 +  return static_cast<uint16_t>(lo + (mozilla::RandomUint64OrDie() % span));
-+}
-+
-+// A realistic STUN round-trip delay (ms) before the srflx surfaces. Real
-+// Firefox emits the srflx ~30-90ms after the host candidate; a zero-delay
-+// srflx (host and srflx arriving together) is an unnatural timing signature.
-+static uint32_t RandomSrflxDelayMs() {
-+  return static_cast<uint32_t>(30u + (mozilla::RandomUint64OrDie() % 60u));
 +}
 +
 +// Extract the value of the first "<prefix><value>" line in an SDP (prefix like
@@ -808,9 +731,8 @@ index 91f927902f..b1f3c6980d 100644
 +
 +  // Helper: append an a=candidate line into both local-description strings,
 +  // right after the first m-section's a=mid: line. The SDP attribute form is
-+  // "a=candidate:<foundation>..." (no leading "candidate:"). Captures `this` and
-+  // `mid` BY VALUE so it stays valid when copied into the delayed srflx runnable
-+  // below (which keeps the PC alive via a strong RefPtr).
++  // "a=candidate:<foundation>..." (no leading "candidate:"). Keep the SDP and
++  // the events in the same order, before signalling gathering completion.
 +  auto injectIntoSdp = [this, mid](const std::string& candStr) {
 +    std::string sdpCand = candStr;
 +    const std::string kCandPrefix = "candidate:";
@@ -837,8 +759,8 @@ index 91f927902f..b1f3c6980d 100644
 +    into(mCurrentLocalDescription);
 +  };
 +
-+  // Mark surfaced now so re-entrant ICE-state changes during the delay below
-+  // don't fabricate a second set.
++  // Mark surfaced before dispatch so re-entrant state changes cannot
++  // fabricate a second set.
 +  mSurfacedPublicCandidate = true;
 +
    JSErrorResult rv;
@@ -858,7 +780,7 @@ index 91f927902f..b1f3c6980d 100644
 +  injectIntoSdp(hostUdpCand);
 +  mPCObserver->OnIceCandidate(0, ObString(mid.c_str()),
 +                              ObString(hostUdpCand.c_str()),
-+                              ObString(ufrag.c_str()), rv);
+                               ObString(ufrag.c_str()), rv);
 +
 +  std::ostringstream hostTcp;
 +  hostTcp << "candidate:2 1 TCP " << kHostTcpPriority << " " << mdnsHost
@@ -867,40 +789,24 @@ index 91f927902f..b1f3c6980d 100644
 +  injectIntoSdp(hostTcpCand);
 +  mPCObserver->OnIceCandidate(0, ObString(mid.c_str()),
 +                              ObString(hostTcpCand.c_str()),
-                               ObString(ufrag.c_str()), rv);
++                              ObString(ufrag.c_str()), rv);
 +
-+  // STEP 2: the srflx (foundation 1, spoof/proxy IP, SAME port as the UDP host),
-+  // delayed by a realistic STUN round-trip so the timing matches a real gather.
-+  // The SDP line is added just before the event fires, so a fingerprinter that
-+  // reads pc.localDescription.sdp inside the candidate handler (CreepJS's
-+  // getIPAddress) sees the public IP on this event -> "stun connection" + "ip"
-+  // populate. A strong ref keeps the PC alive across the delay; bail if closed.
++  // Publish the public candidate and its SDP entry before the caller emits
++  // the null-candidate completion event. Delaying it beyond that event makes
++  // readers miss it and leaves ICE events, SDP and stats inconsistent.
 +  std::ostringstream srflx;
 +  srflx << "candidate:1 1 UDP " << kSrflxPriority << " " << spoofIp << " "
 +        << port << " typ srflx raddr 0.0.0.0 rport 0";
 +  std::string srflxCand = srflx.str();
-+
-+  RefPtr<PeerConnectionImpl> self(this);
-+  std::string midCopy = mid;
-+  std::string ufragCopy = ufrag;
-+  GetMainThreadSerialEventTarget()->DelayedDispatch(
-+      NS_NewRunnableFunction(
-+          "PeerConnectionImpl::EmitFabricatedSrflx",
-+          [self, srflxCand, midCopy, ufragCopy, injectIntoSdp]() {
-+            if (self->IsClosed() || !self->mPCObserver) {
-+              return;
-+            }
-+            injectIntoSdp(srflxCand);
-+            JSErrorResult rv2;
-+            self->mPCObserver->OnIceCandidate(
-+                0, ObString(midCopy.c_str()), ObString(srflxCand.c_str()),
-+                ObString(ufragCopy.c_str()), rv2);
-+          }),
-+      RandomSrflxDelayMs());
++  injectIntoSdp(srflxCand);
++  JSErrorResult srflxRv;
++  mPCObserver->OnIceCandidate(0, ObString(mid.c_str()),
++                              ObString(srflxCand.c_str()),
++                              ObString(ufrag.c_str()), srflxRv);
  }
  
  void PeerConnectionImpl::IceConnectionStateChange(
-@@ -3420,6 +3898,19 @@ void PeerConnectionImpl::IceConnectionStateChange(
+@@ -3434,6 +3818,19 @@ void PeerConnectionImpl::IceConnectionStateChange(
    // If connectionIceConnectionStateChanged is true, fire an event named
    // iceconnectionstatechange at connection.
    if (connectionIceConnectionStateChanged) {
@@ -920,7 +826,7 @@ index 91f927902f..b1f3c6980d 100644
      pcObserver->OnStateChange(PCObserverStateType::IceConnectionState, rv);
    }
  
-@@ -3605,6 +4096,12 @@ void PeerConnectionImpl::IceGatheringStateChange(
+@@ -3619,6 +4016,12 @@ void PeerConnectionImpl::IceGatheringStateChange(
    // If connectionIceGatheringStateChanged is true, fire an event named
    // icegatheringstatechange at connection.
    if (gatheringStateChanged) {
@@ -933,7 +839,7 @@ index 91f927902f..b1f3c6980d 100644
      // NOTE: If we're in the "complete" case, our JS code will fire a null
      // icecandidate event after firing the icegatheringstatechange event.
      // Fire an event named icecandidate using the RTCPeerConnectionIceEvent
-@@ -3696,11 +4193,27 @@ void PeerConnectionImpl::UpdateDefaultCandidate(
+@@ -3710,11 +4113,27 @@ void PeerConnectionImpl::UpdateDefaultCandidate(
      const std::string& defaultRtcpAddr, uint16_t defaultRtcpPort,
      const std::string& transportId) {
    CSFLogDebug(LOGTAG, "%s", __FUNCTION__);
@@ -963,7 +869,7 @@ index 91f927902f..b1f3c6980d 100644
          transportId);
    }
  }
-@@ -4471,8 +4984,10 @@ bool PeerConnectionImpl::GetPrefDefaultAddressOnly() const {
+@@ -4485,8 +4904,10 @@ bool PeerConnectionImpl::GetPrefDefaultAddressOnly() const {
  
    uint64_t winId = mWindow->WindowID();
  
