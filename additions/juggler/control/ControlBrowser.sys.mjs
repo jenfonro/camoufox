@@ -10,7 +10,7 @@ const {MouseDispatch} = ChromeUtils.importESModule("chrome://juggler/content/inp
 
 export const METHODS = [
   "browser.getInfo", "browser.close",
-  "browsingContext.getTree", "browsingContext.create", "browsingContext.close",
+  "browsingContext.getTree", "browsingContext.getFrame", "browsingContext.create", "browsingContext.close",
   "browsingContext.activate", "browsingContext.navigate", "browsingContext.reload",
   "browsingContext.traverseHistory", "browsingContext.captureScreenshot",
   "page.info", "page.getDialogs", "page.handleDialog",
@@ -105,16 +105,22 @@ export class ControlBrowser {
     const win = browser?.ownerDocument?.defaultView;
     if (!win?.gBrowser?.getTabForBrowser(browser)) return;
     const context = String(bc.id);
+    const originalOpener = bc.crossGroupOpener;
     if (!this.contexts.has(context)) {
       const ancestors = [];
       for (let parent = bc.parent; parent; parent = parent.parent)
         ancestors.push(String(parent.id));
       const description = {context, parent: ancestors[0] || null, ancestors,
         url: bc.currentURI?.spec || "about:blank",
-        userContextId: bc.originAttributes?.userContextId || 0};
+        userContextId: bc.originAttributes?.userContextId || 0,
+        originalOpener: originalOpener ? String(originalOpener.id) : null};
       this.contexts.set(context, description);
       this.emit("browsingContext.created", description);
     }
+    // Firefox can attach the browser before assigning its cross-group opener.
+    // Preserve the native creation relation even after the source tab closes.
+    if (originalOpener)
+      this.contexts.get(context).originalOpener = String(originalOpener.id);
     for (const child of bc.children) this.trackContext(child);
   }
 
@@ -203,6 +209,7 @@ export class ControlBrowser {
       context: String(bc.id), parent: bc.parent ? String(bc.parent.id) : null,
       url: bc.currentURI?.spec || bc.currentWindowGlobal?.documentURI?.spec || "about:blank",
       userContextId: bc.originAttributes?.userContextId || 0,
+      originalOpener: this.contexts.get(String(bc.id))?.originalOpener || null,
       children: depth > 0 ? bc.children.map(c => this.tree(c, depth - 1)) : [],
     };
   }
@@ -217,7 +224,6 @@ export class ControlBrowser {
         const info = await this.query(context, "page.info", {}, {signal, timeout: 3000});
         const committed = !previous || (
           (this.navigationSequence.get(context) || 0) !== previous.sequence &&
-          (bc.currentWindowGlobal?.innerWindowId !== previous.document || info.url !== previous.url) &&
           !(info.url === "about:blank" && previous.target !== "about:blank"));
         if (committed && info.url === bc.currentURI?.spec && accepted.includes(info.readyState) &&
             (wait === "interactive" || !bc.top.embedderElement?.webProgress?.isLoadingDocument))
@@ -235,8 +241,7 @@ export class ControlBrowser {
     const context = string(p.context, "context");
     const bc = this.context(context);
     const wait = choice(p.wait ?? "complete", "wait", ["none", "interactive", "complete"]);
-    const previous = {document: bc.currentWindowGlobal?.innerWindowId,
-      url: bc.currentURI?.spec, target: p.url || bc.currentURI?.spec,
+    const previous = {target: p.url || bc.currentURI?.spec,
       sequence: this.navigationSequence.get(context) || 0};
     if (method === "browsingContext.navigate") {
       let uri;
@@ -372,7 +377,8 @@ export class ControlBrowser {
       return this.network.command(method, p, session);
     }
     if (method === "dom.setFiles") return this.setFiles(p, options);
-    if (method === "page.info" || method.startsWith("dom.") || method === "script.evaluate" ||
+    if (method === "page.info" || method === "browsingContext.getFrame" ||
+        method.startsWith("dom.") || method === "script.evaluate" ||
         ["storage.get", "storage.set", "storage.remove", "storage.clear"].includes(method))
       return this.query(string(p.context, "context"), method, p, options);
     if (method.startsWith("storage.")) return this.cookies(method, p);
@@ -406,7 +412,9 @@ export class ControlBrowser {
         return {};
       case "browsingContext.getTree": {
         const depth = number(p.maxDepth ?? 20, "maxDepth", 0, 100, true);
-        return {contexts: (p.root ? [this.context(p.root)] : this.roots()).map(bc => this.tree(bc, depth))};
+        const roots = p.root ? [this.context(p.root)] : this.roots();
+        for (const bc of roots) this.trackContext(bc);
+        return {contexts: roots.map(bc => this.tree(bc, depth))};
       }
       case "browsingContext.create": {
         const type = choice(p.type ?? "tab", "type", ["tab", "window"]);

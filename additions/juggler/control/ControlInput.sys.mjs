@@ -125,13 +125,18 @@ export class ControlInput {
     state.x = x;
     state.y = y;
     state.buttons = buttons;
+    const fullZoom = browser.browsingContext.fullZoom;
+    const parentPoint = dispatch.toAbsolute(top.x, top.y);
     const ack = await dispatch.sendNativeAcked(eventType, top.x, top.y);
     this.lastEvent = {type: eventType, context, completed: ack, point: top,
-      parentPoint: dispatch.toAbsolute(top.x, top.y), fullZoom: browser.browsingContext.fullZoom};
+      parentPoint, fullZoom};
     if (!ack) fail("input timeout", "The renderer did not acknowledge input");
-    if (type === "pointerDown" && button === 2)
-      await dispatch.sendNativeAcked("contextmenu", top.x, top.y);
-    await this.controller.query(context, "input.barrier", {}, options);
+    if (type === "pointerDown" && button === 2 &&
+        !await dispatch.sendNativeAcked("contextmenu", top.x, top.y))
+      fail("input timeout", "The renderer did not acknowledge the context menu");
+    // The native callback acknowledges dispatch through APZ and the renderer.
+    // A click can destroy its frame; querying that document afterward would
+    // turn completed input into an error.
     return {};
   }
 
@@ -156,17 +161,12 @@ export class ControlInput {
     await this.controller.query(context, "input.focus", {}, options);
     const win = this.controller.browser(context).ownerDocument.defaultView;
     const key = params.key;
-    const keyCodes = {Backspace: 8, Tab: 9, Enter: 13, Shift: 16, Control: 17,
-      Alt: 18, Pause: 19, CapsLock: 20, Escape: 27, " ": 32, PageUp: 33,
-      PageDown: 34, End: 35, Home: 36, ArrowLeft: 37, ArrowUp: 38,
-      ArrowRight: 39, ArrowDown: 40, Insert: 45, Delete: 46, Meta: 91};
-    const code = params.code ?? (/^[a-z]$/i.test(key) ? `Key${key.toUpperCase()}` :
-      /^[0-9]$/.test(key) ? `Digit${key}` : key === " " ? "Space" :
-      ["Control", "Shift", "Alt", "Meta"].includes(key) ? `${key}Left` : key.length > 1 ? key : "");
-    const keyCode = params.keyCode ?? keyCodes[key] ??
-      (/^[a-z0-9]$/i.test(key) ? key.toUpperCase().charCodeAt(0) :
-        /^F([1-9]|1[0-9]|2[0-4])$/.test(key) ? 111 + Number(key.slice(1)) : 0);
-    this.processor(win)[params.type](new win.KeyboardEvent("", {key, code, keyCode,
+    const processor = this.processor(win);
+    const code = params.code ?? (processor.computeCodeValueOfNonPrintableKey(key, params.location) ||
+      processor.guessCodeValueOfPrintableKeyInUSEnglishKeyboardLayout(key, params.location));
+    const keyCode = params.keyCode ??
+      processor.guessKeyCodeValueOfPrintableKeyInUSEnglishKeyboardLayout(key, params.location);
+    processor[params.type](new win.KeyboardEvent("", {key, code, keyCode,
       location: params.location || 0, repeat: !!params.repeat}), 0);
     await this.controller.query(context, "input.barrier", {}, options);
     return {};
@@ -193,6 +193,7 @@ export class ControlInput {
   }
 
   async wheel(context, params, state, options) {
+    checkAbort(options.signal);
     const x = number(params.x, "x", 0);
     const y = number(params.y, "y", 0);
     const page = await this.controller.query(context, "page.info", {}, options);
@@ -270,6 +271,17 @@ export class ControlInput {
     const operation = this.queue.then(async () => {
       checkAbort(options.signal);
       const context = string(params.context, "context");
+      // Input belongs to the connection, even after its target is discarded.
+      // Releasing it must not activate or recreate a document.
+      if (method === "input.releaseActions") {
+        const state = this.states.get(session.id);
+        if (state) {
+          await this.releaseState(state);
+          this.states.delete(session.id);
+        }
+        if (this.owner === session.id) this.owner = null;
+        return {};
+      }
       if (this.owner && this.owner !== session.id)
         fail("input busy", "Another connection has pressed input; release it before transferring control");
       await this.controller.activate(context, options);
@@ -279,11 +291,6 @@ export class ControlInput {
         if (method === "input.dispatchKey") return await this.key(context, params, state, options);
         if (method === "input.insertText") return await this.insertText(context, params, options);
         if (method === "input.dispatchWheel") return await this.wheel(context, params, state, options);
-        if (method === "input.releaseActions") {
-          await this.releaseState(state);
-          state.sources.clear();
-          return {};
-        }
         if (method === "input.click") {
           const count = number(params.count ?? 1, "count", 1, 3, true);
           if (params.node)
@@ -356,7 +363,21 @@ export class ControlInput {
               await this.key(context, {...action, type: choice(action.type, "type", ["keyDown", "keyUp"]) === "keyDown" ? "keydown" : "keyup",
                 key: action.key ?? action.value}, state, options);
             } else if (source.type === "wheel" && action.type === "scroll") {
-              await this.wheel(context, action, state, options);
+              const deltaX = number(action.deltaX ?? 0, "deltaX");
+              const deltaY = number(action.deltaY ?? 0, "deltaY");
+              const steps = duration ? Math.max(1, Math.ceil(duration / 16)) : 1;
+              let sentX = 0, sentY = 0;
+              for (let step = 1; step <= steps; step++) {
+                const remaining = started + duration * step / steps - Date.now();
+                if (remaining > 0) await delay(remaining, options.signal);
+                const x = step === steps ? deltaX : Math.trunc(deltaX * step / steps);
+                const y = step === steps ? deltaY : Math.trunc(deltaY * step / steps);
+                if (x !== sentX || y !== sentY) {
+                  await this.wheel(context, {...action, deltaX: x - sentX, deltaY: y - sentY}, state, options);
+                  sentX = x;
+                  sentY = y;
+                }
+              }
             } else {
               fail("invalid argument", "Action does not match its source");
             }

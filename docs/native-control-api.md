@@ -133,7 +133,8 @@ has left the live tree.
 | --- | --- |
 | `browser.getInfo` | Browser version, build ID, process ID, protocol version. Optional `diagnostics: true` reports internal modules, existing actors and focus/BFCache override state; it does not attach a debugger |
 | `browser.close` | Requests a normal browser shutdown; native unload/dialog rules still apply |
-| `browsingContext.getTree` | `root?`, `maxDepth?` (0–100); returns `contexts` with context, parent, URL, userContextId, children |
+| `browsingContext.getTree` | `root?`, `maxDepth?` (0–100); returns `contexts` with context, parent, URL, userContextId, originalOpener, children |
+| `browsingContext.getFrame` | Parent `context` and exactly one of `selector` (CSS, one iframe/frame) or `child` (context ID). Returns `{context, visible}`; `context: null` if absent. Ambiguous/non-frame selectors are errors |
 | `browsingContext.create` | `type: "tab" | "window"` (tab), `referenceContext?`, `background?`, `userContextId?` for a tab, `private?` for a window; returns `context` |
 | `browsingContext.close` | Requests normal closure of `context`, a top-level tab; native unload dialogs can defer it |
 | `browsingContext.activate` | `context`; selects its tab, raises the browser window and focuses content as an explicit action |
@@ -141,7 +142,18 @@ has left the live tree.
 | `browsingContext.reload` | `context`, `ignoreCache?`, `wait?` |
 | `browsingContext.traverseHistory` | `context`, signed integer `delta`, `wait?`; zero does nothing |
 
-Navigation waits observe a new navigation before accepting document readiness.
+`originalOpener` records Firefox's cross-group creation source, including
+`noopener` tabs, independently of the page's `window.opener`. It remains the
+source context ID if that source closes while the control component is active.
+It is null when Firefox has no known source; unrelated new tabs are not inferred
+from selection, ordering, or URL.
+
+Frame lookup uses the native embedder element and browsing context association.
+It emits no page messages and does not modify frame names, attributes or globals.
+Visibility uses the real parent viewport, independently of profile dimensions.
+
+Navigation waits observe a new navigation before accepting document readiness,
+including same-document commits whose URL is unchanged.
 They follow native redirects and navigation security rules. A wait is bounded
 by the request timeout and can be cancelled.
 
@@ -207,6 +219,8 @@ Buttons use DOM numbering: 0 primary, 1 auxiliary, 2 secondary, 3 back, 4 forwar
 Modifiers are `Shift`, `Control`, `Alt`, `Meta`. `key` uses UI Events names or a
 Unicode character, not WebDriver's private-use escape codes. `code` describes
 physical position; provide it explicitly when keyboard layout matters.
+When omitted, physical codes are derived only for known keys. Arbitrary Unicode,
+including supplementary characters, uses an unspecified physical code.
 
 Action sources have `id`, `type` (`pointer`, `key`, `wheel`, `none`), and
 `actions`. Pointer sources support `parameters: {pointerType: "mouse"}`.
@@ -216,6 +230,11 @@ Move `origin` is `"viewport"`, `"pointer"`, or `{node: id}`. Durations are in
 milliseconds. A source ID keeps its type until release. Ticks keep the
 longest action duration; instantaneous key/button transitions are applied before
 duration-based pointer movement.
+A source accepts at most 1000 actions per request. Text callers can submit
+successive batches ending at key-up boundaries on the same source, with one
+overall deadline. `scroll` spreads its signed deltas over its duration; zero
+duration dispatches immediately. `pointerDown` and `pointerUp` accept matching
+`clickCount` values for successive clicks, including double-clicks.
 
 Mouse movement while a button is held can initiate native drag-and-drop.
 Subsequent moves and release use the native drag session; Escape/release/disconnect
@@ -224,6 +243,10 @@ actions, regardless of the legacy Juggler `humanize` option.
 Mouse and wheel completion uses Firefox's native callbacks through APZ and
 out-of-process frames, with a five-second delivery bound. Keys and text use the
 native text-input processor on the browser widget, including browser shortcuts.
+An acknowledged mouse action remains successful when its event handler destroys
+the source document. A later action targeting that missing context still fails.
+`input.releaseActions` releases the connection's state even if the context has
+closed; it does not activate a replacement document.
 
 Commands are serialized for the shared physical input state. Another connection
 cannot take over while a connection has pressed keys/buttons. Errors, cancellation,

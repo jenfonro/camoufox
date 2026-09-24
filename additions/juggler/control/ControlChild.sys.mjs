@@ -230,6 +230,32 @@ export class CamoufoxControlChild extends JSWindowActorChild {
         return {p1: {x: quad.p1.x, y: quad.p1.y}, p2: {x: quad.p2.x, y: quad.p2.y},
           p4: {x: quad.p4.x, y: quad.p4.y}, width: frame.clientWidth, height: frame.clientHeight};
       }
+      case "browsingContext.getFrame": {
+        if ((params.selector === undefined) === (params.child === undefined))
+          fail("invalid argument", "Provide exactly one of selector or child");
+        let child;
+        if (params.selector !== undefined) {
+          const selector = string(params.selector, "selector");
+          let matches;
+          try { matches = doc.querySelectorAll(selector); }
+          catch (_) { fail("invalid selector", "CSS selector could not be parsed"); }
+          if (!matches.length) return {context: null, visible: false};
+          if (matches.length !== 1 || !["iframe", "frame"].includes(matches[0].localName))
+            fail("invalid argument", "selector must resolve exactly one frame element");
+          child = this.browsingContext.children.find(c => c.embedderElement === matches[0]);
+        } else {
+          const context = string(params.child, "child");
+          child = this.browsingContext.children.find(c => String(c.id) === context);
+        }
+        const frame = child?.embedderElement;
+        if (!frame || child.isDiscarded) return {context: null, visible: false};
+        const rect = frame.getBoundingClientRect();
+        const [width, height] = ChromeUtils.camouGetNativeViewportSize(win);
+        return {context: String(child.id),
+          visible: frame.checkVisibility({opacityProperty: true, visibilityProperty: true}) &&
+            rect.width > 0 && rect.height > 0 && rect.right > 0 && rect.bottom > 0 &&
+            rect.x < width && rect.y < height};
+      }
       case "input.barrier":
         await new Promise(resolve => setTimeout(resolve, 0));
         return {};
